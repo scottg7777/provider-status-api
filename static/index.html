@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CHS Provider Status Lookup</title>
+  <meta name="description" content="Look up a provider's NPPES, Medicare PECOS, Plan-Net network, and Stedi EDI enrollment status.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b3a4a'/%3E%3Cpath d='M15 7h2v6h6v2h-6v6h-2v-6H9v-2h6V7z' fill='%235eead4'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="site-header">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="32" height="32">
+            <rect width="32" height="32" rx="8" fill="currentColor"></rect>
+            <path d="M15 7h2v6h6v2h-6v6h-2v-6H9v-2h6V7z" fill="#5eead4"></path>
+          </svg>
+        </div>
+        <div>
+          <h1>CHS Provider Status Lookup</h1>
+          <p class="subtitle">NPPES · Medicare PECOS · Plan-Net FHIR · Stedi EDI</p>
+        </div>
+      </div>
+      <div class="header-meta">
+        <div id="health-badge" class="health-badge is-loading" role="status" aria-live="polite">
+          <span class="pulse"></span>
+          <span class="health-label">Checking Stedi…</span>
+        </div>
+        <a class="docs-link" href="/docs" target="_blank" rel="noopener">API docs</a>
+      </div>
+    </header>
+
+    <nav class="tabs" role="tablist" aria-label="Workspace">
+      <button class="tab is-active" role="tab" aria-selected="true" data-tab="lookup">Single Lookup</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="batch">Batch Lookup</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="payers">Supported Payers</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="history">Recent History</button>
+    </nav>
+
+    <main>
+      <section id="panel-lookup" class="panel is-active" role="tabpanel">
+        <form id="lookup-form" class="lookup-form card" autocomplete="off">
+          <div class="form-grid">
+            <label class="field">
+              <span>National Provider Identifier</span>
+              <input id="npi" name="npi" inputmode="numeric" maxlength="10" pattern="\d{10}" placeholder="10-digit NPI" required>
+            </label>
+            <label class="field">
+              <span>Payer <em>(optional)</em></span>
+              <input id="payer" name="payer" list="payer-list" placeholder="All payers, or type a name (e.g. Aetna)">
+              <datalist id="payer-list"></datalist>
+            </label>
+            <label class="field">
+              <span>Tax ID <em>(optional, not stored)</em></span>
+              <input id="tin" name="tin" maxlength="12" placeholder="For Stedi filters only" autocomplete="off">
+            </label>
+            <div class="field field-action">
+              <button type="submit" class="btn btn-primary" id="lookup-submit">Look up provider</button>
+            </div>
+          </div>
+          <div class="samples">
+            <span>Try a sample:</span>
+            <button type="button" class="chip" data-npi="1003000126" data-payer="cigna">1003000126 / Cigna</button>
+            <button type="button" class="chip" data-npi="1437170412" data-payer="unitedhealthcare">1437170412 / UHC</button>
+            <button type="button" class="chip" data-npi="1710975354" data-payer="humana">1710975354 / Humana</button>
+            <button type="button" class="chip" data-npi="1003000126" data-payer="medicare">1003000126 / Medicare</button>
+          </div>
+        </form>
+
+        <div id="lookup-status" class="status-line" hidden></div>
+        <div id="lookup-results"></div>
+      </section>
+
+      <section id="panel-batch" class="panel" role="tabpanel" hidden>
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <h2>Batch lookup</h2>
+              <p class="muted">Paste up to 50 rows as <code>NPI</code> or <code>NPI,payer,tin</code>, or upload a CSV with those columns.</p>
+            </div>
+          </div>
+          <textarea id="batch-input" rows="8" placeholder="1003000126,cigna&#10;1437170412,unitedhealthcare&#10;1710975354"></textarea>
+          <div class="row-actions">
+            <label class="btn btn-ghost file-btn">
+              Upload CSV
+              <input id="batch-file" type="file" accept=".csv,text/csv,text/plain" hidden>
+            </label>
+            <span id="batch-count" class="muted">0 rows</span>
+            <button type="button" id="batch-run" class="btn btn-primary">Run batch</button>
+          </div>
+        </div>
+        <div id="batch-status" class="status-line" hidden></div>
+        <div id="batch-results"></div>
+      </section>
+
+      <section id="panel-payers" class="panel" role="tabpanel" hidden>
+        <div id="payers-status" class="status-line" hidden></div>
+        <div id="payers-results">
+          <p class="muted">Loading payer catalog…</p>
+        </div>
+      </section>
+
+      <section id="panel-history" class="panel" role="tabpanel" hidden>
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <h2>Recent history</h2>
+              <p class="muted">Stored in this browser only. Tax IDs and API keys are never saved.</p>
+            </div>
+            <button type="button" id="history-clear" class="btn btn-ghost">Clear history</button>
+          </div>
+          <div id="history-results"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="drawer" class="drawer" hidden>
+    <div class="drawer-backdrop" data-close-drawer></div>
+    <aside class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+      <div class="drawer-top">
+        <h2 id="drawer-title">Lookup details</h2>
+        <button type="button" class="icon-btn" data-close-drawer aria-label="Close details">×</button>
+      </div>
+      <div id="drawer-body" class="drawer-body"></div>
+    </aside>
+  </div>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

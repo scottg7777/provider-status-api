@@ -44,6 +44,10 @@ uvicorn app:app --host 127.0.0.1 --port 8080
 | `GET` | `/payers` | Live FHIR payers, CMS sources, Stedi URLs, and the `unsupported_or_auth_required` list |
 | `GET` | `/provider-status?npi=&payer=&tin=` | Combined lookup. `payer` and `tin` are optional. |
 | `POST` | `/provider-status/batch` | Up to 50 `{npi, payer?, tin?}` items, run with bounded concurrency |
+| `POST` | `/eligibility-readiness` | Eligibility Readiness Check: one Stedi real-time 270/271 under the NPI, classified as RECOGNIZED / PROVIDER_NOT_RECOGNIZED / PATIENT_ISSUE / PAYER_UNAVAILABLE / INCONCLUSIVE |
+| `GET` | `/payers/search?q=` | Stedi Payer Network search (payer typeahead) with eligibility / claims / ERA support |
+| `GET` | `/eligibility-readiness/prefill?npi=` | Provider name from NPPES (org vs. first/last) to prefill the check |
+| `GET` | `/eligibility-readiness/mock-requests` | Stedi-documented PHI-free mock requests (Stedi **test** API key only) |
 
 Example:
 
@@ -55,6 +59,34 @@ curl -sS "http://127.0.0.1:8080/provider-status?npi=1003000126&payer=cigna"
 ```
 
 `payer` accepts names or aliases such as `cigna`, `humana`, `uhc`, `unitedhealthcare`, `centene`, `molina`, `bcbsri`, `medicare` / `pecos`, or a major payer that is documented as auth-required (for example `aetna`). For `medicare`, only NPPES + PECOS + Stedi run. For `aetna`, public CMS results still return and the FHIR section explains that OAuth / registration is required.
+
+## Eligibility Readiness Check
+
+Goal: tell whether a payer recognizes a provider NPI (a proxy for "ready to submit claims") before any claim exists. The app sends one Stedi real-time eligibility check (270/271) under the provider's NPI for one real member on that payer's plan and classifies the 271:
+
+| Classification | Meaning |
+| --- | --- |
+| `RECOGNIZED` | Active coverage returned, no provider-related AAA errors |
+| `PROVIDER_NOT_RECOGNIZED` | Provider-related AAA: 41, 43, 44, 45, 46, 47, 49, 50, 51, 52, 53, 97, or 35 (Out of Network) |
+| `PATIENT_ISSUE` | Member/patient AAA (58, 60, 61, 64–78, e.g. 72, 73, 75, 76) — inconclusive for the provider |
+| `PAYER_UNAVAILABLE` | AAA 42 (retryable follow-up), 79, 80; HTTP 429/5xx; timeouts. Stedi documents 79 as a payer connectivity/routing problem, so it is not treated as a provider rejection |
+| `INCONCLUSIVE` | Anything else (inactive coverage, 42 with "Please Correct and Resubmit", Stedi 400 validation errors, payer doesn't support real-time eligibility) |
+| `PAYER_AMBIGUOUS` | The payer text matched several Stedi payers; the response lists `payer_matches` to pick from. No check is sent |
+
+The response also includes the AAA codes with descriptions/level/follow-up, coverage active yes/no, plan status, payer name, in/out-of-network benefit-tier indicators (benefit-tier info, **not** proof of participation), and the Stedi transaction-enrollment status for that NPI + payer. A `RECOGNIZED` result is a strong signal, not proof of contracting or credentialing.
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/eligibility-readiness \
+  -H 'Content-Type: application/json' \
+  -d '{"npi":"1999999984","payer":"87726","provider_organization_name":"Provider Name",
+       "member_id":"UHC123456","first_name":"Jane","last_name":"Doe","date_of_birth":"1971-01-01"}'
+```
+
+Inputs: `npi`, `payer` (Stedi payer ID, primary payer ID, alias, or name), optional `provider_organization_name` or `provider_first_name`/`provider_last_name` (NPPES is used when omitted), `member_id`, `first_name`, `last_name`, `date_of_birth`, optional `date_of_service`, `service_type_code` (default `30`), and optional `dependent_*` fields.
+
+PHI handling: request/response bodies and member data are never logged or stored on the server; the response omits member name, DOB, and raw X12, and masks the member ID; validation errors don't echo submitted values; the browser history stores only NPI, payer, classification, and time.
+
+The UI is the **Eligibility Readiness** tab. Deep link: `/?tab=eligibility&npi=1699443499&payer=cigna`. The values above are a Stedi mock request; mock requests only return mock data with a Stedi test API key (with a production key they'd go to the real payer).
 
 Batch:
 
@@ -125,6 +157,7 @@ Stedi cannot automate CAQH credentialing, license primary-source verification, o
 
 - Enrollments: `GET https://enrollments.us.stedi.com/2024-09-01/enrollments?providerNpis=&providerTaxIds=&payerIds=`
 - Payer search: `GET https://payers.us.stedi.com/2024-04-01/payers/search?query=`
+- Real-time eligibility (270/271 JSON, legacy shape): `POST https://healthcare.us.stedi.com/2024-04-01/change/medicalnetwork/eligibility/v3`. Stedi now also offers a newer `POST https://healthcare.us.stedi.com/2026-06-01/eligibility-check` with a different request/response shape; the legacy v3 endpoint is still supported and is what this app uses.
 - Auth: `Authorization: <STEDI_API_KEY>` (Stedi still accepts the legacy `Authorization: Key <api_key>` prefix).
 
 ## Tests
@@ -145,9 +178,11 @@ cli.py              Command-line entry point
 service.py          Combined lookup orchestration
 models.py           Request models
 test_api.py         Unit + live smoke tests
+test_eligibility.py Eligibility readiness unit tests (mocked Stedi, PHI-not-logged checks)
+eligibility.py      Eligibility readiness request building + 271 classification
 clients/nppes.py    CMS NPPES
 clients/pecos.py    CMS PECOS public enrollment
 clients/fhir.py     Plan-Net FHIR
-clients/stedi.py    Stedi enrollments + payer search
+clients/stedi.py    Stedi enrollments, payer search, real-time eligibility
 clients/registry.py Live and unsupported payer lists
 ```

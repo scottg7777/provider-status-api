@@ -28,13 +28,16 @@ _load_local_env()
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from clients.http_util import new_async_client
 from clients.npi_util import validate_npi
+from clients import stedi as stedi_client
 from clients.stedi import is_configured
-from models import BatchRequest, HealthResponse
+from eligibility import mock_catalog, pick_payer, provider_prefill, run_readiness_check, _payer_option
+from models import BatchRequest, EligibilityReadinessRequest, HealthResponse
 from service import lookup_batch, lookup_provider_status, payers_catalog
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -87,6 +90,16 @@ async def password_gate(request: Request, call_next):
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    # Never echo submitted values (member ID, names, DOB) back in validation errors.
+    detail = [
+        {"loc": list(err.get("loc") or []), "msg": err.get("msg"), "type": err.get("type")}
+        for err in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": detail})
+
+
 @app.exception_handler(ValueError)
 async def value_error_handler(_request: Request, exc: ValueError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": str(exc)})
@@ -130,3 +143,47 @@ async def provider_status_batch(payload: BatchRequest, request: Request) -> dict
     items = [item.model_dump() for item in payload.items]
     results = await lookup_batch(request.app.state.http, items)
     return {"count": len(results), "results": results}
+
+
+@app.get("/payers/search")
+async def payers_search(
+    request: Request,
+    q: str = Query(..., min_length=2, max_length=120, description="Payer name, Stedi payer ID, or alias"),
+) -> dict[str, Any]:
+    """Stedi Payer Network search (typeahead for the eligibility readiness check)."""
+    if not is_configured():
+        return {"configured": False, "query": q, "results": [], "message": stedi_client.NOT_CONFIGURED_MESSAGE}
+    try:
+        matches = await stedi_client.search_payers(request.app.state.http, q, limit=15)
+    except PermissionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:  # httpx errors
+        raise HTTPException(status_code=502, detail=f"Stedi payer search failed: {exc.__class__.__name__}") from exc
+    return {"configured": True, "query": q, "results": [_payer_option(m) for m in matches]}
+
+
+@app.get("/eligibility-readiness/prefill")
+async def eligibility_prefill(request: Request, npi: str = Query(...)) -> dict[str, Any]:
+    """Provider name from NPPES, used to prefill the eligibility readiness form."""
+    try:
+        npi = validate_npi(npi)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await provider_prefill(request.app.state.http, npi)
+
+
+@app.get("/eligibility-readiness/mock-requests")
+async def eligibility_mock_requests() -> dict[str, Any]:
+    """Stedi-documented PHI-free mock eligibility requests (work with a Stedi test API key only)."""
+    return mock_catalog()
+
+
+@app.post("/eligibility-readiness")
+async def eligibility_readiness(payload: EligibilityReadinessRequest, request: Request) -> dict[str, Any]:
+    """Send one Stedi real-time 270 under the NPI and classify whether the payer recognizes the provider.
+
+    Classifications: RECOGNIZED, PROVIDER_NOT_RECOGNIZED, PATIENT_ISSUE, PAYER_UNAVAILABLE,
+    INCONCLUSIVE (plus PAYER_AMBIGUOUS when the payer search needs a pick). Member data is
+    not logged or stored, and the response omits member name/DOB and masks the member ID.
+    """
+    return await run_readiness_check(request.app.state.http, payload.model_dump())

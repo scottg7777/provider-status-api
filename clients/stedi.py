@@ -268,3 +268,47 @@ async def lookup_enrollments(
             "open_tasks": [],
             "error": f"Stedi request failed: {exc.__class__.__name__}",
         }
+
+
+class StediEligibilityHTTPError(Exception):
+    """Non-200 response from the eligibility endpoint.
+
+    Carries only the status code and Stedi's error payload (never the request body).
+    """
+
+    def __init__(self, status_code: int, payload: dict[str, Any] | None):
+        super().__init__(f"Stedi eligibility request returned HTTP {status_code}")
+        self.status_code = status_code
+        self.payload = payload or {}
+
+
+async def eligibility_check(
+    client: httpx.AsyncClient,
+    body: dict[str, Any],
+    *,
+    timeout: float = 70.0,
+) -> dict[str, Any]:
+    """POST a real-time 270 to Stedi and return the parsed 271 JSON.
+
+    PHI safety: this function never logs or prints ``body`` or the response.
+    Raises PermissionError on 401/403, StediEligibilityHTTPError on other non-200
+    responses, and lets httpx transport errors (timeouts, connect errors) propagate.
+    """
+    from .registry import STEDI_ELIGIBILITY_URL
+
+    headers = {**_auth_headers(), "Content-Type": "application/json"}
+    response = await client.post(
+        STEDI_ELIGIBILITY_URL,
+        json=body,
+        headers=headers,
+        timeout=httpx.Timeout(timeout, connect=10.0),
+    )
+    if response.status_code in {401, 403}:
+        raise PermissionError("Stedi authentication failed. Check STEDI_API_KEY.")
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if response.status_code != 200:
+        raise StediEligibilityHTTPError(response.status_code, payload if isinstance(payload, dict) else None)
+    return payload if isinstance(payload, dict) else {}

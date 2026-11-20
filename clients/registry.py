@@ -210,6 +210,10 @@ PECOS_DATA_URL = f"https://data.cms.gov/data-api/v1/dataset/{PECOS_DATASET_ID}/d
 
 STEDI_ENROLLMENTS_BASE = "https://enrollments.us.stedi.com/2024-09-01"
 STEDI_PAYERS_BASE = "https://payers.us.stedi.com/2024-04-01"
+# Real-Time Eligibility Check (270/271) JSON - Legacy endpoint, verified against
+# stedi.com/docs/healthcare/api-reference/post-healthcare-eligibility-legacy (2026-11-20).
+STEDI_HEALTHCARE_BASE = "https://healthcare.us.stedi.com/2024-04-01"
+STEDI_ELIGIBILITY_URL = f"{STEDI_HEALTHCARE_BASE}/change/medicalnetwork/eligibility/v3"
 
 
 def _norm(value: str) -> str:

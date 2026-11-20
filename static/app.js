@@ -665,6 +665,322 @@
       </div>`;
   }
 
+
+  /* ---------------- Eligibility readiness ---------------- */
+  const ELIG_HISTORY_KEY = "chs-eligibility-readiness-history-v1";
+  const ELIG_LABELS = {
+    RECOGNIZED: "Recognized",
+    PROVIDER_NOT_RECOGNIZED: "Provider not recognized",
+    PATIENT_ISSUE: "Patient / member issue",
+    PAYER_UNAVAILABLE: "Payer unavailable",
+    INCONCLUSIVE: "Inconclusive",
+    PAYER_AMBIGUOUS: "Pick a payer",
+  };
+  const eligState = { payerOptions: new Map(), searchTimer: null, lastQuery: "", prefillNpi: "", mocks: null };
+
+  function eligBadge(cls) {
+    const key = ELIG_LABELS[cls] ? cls : "INCONCLUSIVE";
+    return `<span class="elig-status-badge elig-${key}"><span class="dot"></span>${escapeHtml(ELIG_LABELS[key])}</span>`;
+  }
+
+  function setProviderType(type) {
+    $("elig-ptype").value = type === "organization" ? "organization" : "individual";
+    const org = $("elig-ptype").value === "organization";
+    document.querySelectorAll(".elig-org").forEach((el) => { el.hidden = !org; });
+    document.querySelectorAll(".elig-person").forEach((el) => { el.hidden = org; });
+  }
+
+  async function eligPrefill(force = false) {
+    const npi = $("elig-npi").value.trim();
+    if (!/^\d{10}$/.test(npi) || (!force && npi === eligState.prefillNpi)) return;
+    eligState.prefillNpi = npi;
+    try {
+      const data = await fetchJson(`/eligibility-readiness/prefill?npi=${encodeURIComponent(npi)}`);
+      if (!data.found) {
+        showStatus($("elig-status"), "NPI not found in NPPES. Enter the provider name manually.", "is-error");
+        return;
+      }
+      setProviderType(data.provider_type);
+      $("elig-org").value = data.organization_name || "";
+      $("elig-pfirst").value = data.first_name || "";
+      $("elig-plast").value = data.last_name || "";
+      showStatus($("elig-status"), `NPPES: ${data.name || npi}`, "is-ok");
+    } catch (error) {
+      showStatus($("elig-status"), error.message || "NPPES prefill failed.", "is-error");
+    }
+  }
+
+  function payerOptionLabel(p) {
+    const id = p.primary_payer_id || p.stedi_payer_id || "";
+    return `${p.name || id} · ${id}`;
+  }
+
+  function updatePayerHint() {
+    const opt = eligState.payerOptions.get($("elig-payer").value);
+    const hint = $("elig-payer-hint");
+    if (!opt) { hint.textContent = ""; return; }
+    const elig = String(opt.eligibility_support || "unknown").replaceAll("_", " ").toLowerCase();
+    hint.textContent = `Stedi ID ${opt.stedi_payer_id || "—"} · eligibility: ${elig}`;
+  }
+
+  async function eligPayerSearch() {
+    const q = $("elig-payer").value.trim();
+    if (q.length < 2 || q === eligState.lastQuery || eligState.payerOptions.has(q)) { updatePayerHint(); return; }
+    eligState.lastQuery = q;
+    try {
+      const data = await fetchJson(`/payers/search?q=${encodeURIComponent(q)}`);
+      if (!data.configured) {
+        $("elig-payer-hint").textContent = "Stedi isn't configured on this server.";
+        return;
+      }
+      const list = $("elig-payer-list");
+      (data.results || []).forEach((p) => eligState.payerOptions.set(payerOptionLabel(p), p));
+      list.innerHTML = (data.results || [])
+        .map((p) => `<option value="${escapeHtml(payerOptionLabel(p))}">${escapeHtml((p.aliases || []).slice(0, 4).join(", "))}</option>`)
+        .join("");
+    } catch (error) {
+      $("elig-payer-hint").textContent = error.message || "Payer search failed.";
+    }
+  }
+
+  function resolvedPayerValue() {
+    const raw = $("elig-payer").value.trim();
+    const opt = eligState.payerOptions.get(raw);
+    if (opt) return opt.stedi_payer_id || opt.primary_payer_id || raw;
+    return raw;
+  }
+
+  function eligPayload() {
+    const org = $("elig-ptype").value === "organization";
+    const body = {
+      npi: $("elig-npi").value.trim(),
+      payer: resolvedPayerValue(),
+      member_id: $("elig-member").value.trim(),
+      first_name: $("elig-first").value.trim(),
+      last_name: $("elig-last").value.trim(),
+      date_of_birth: $("elig-dob").value,
+      service_type_code: $("elig-stc").value.trim() || "30",
+    };
+    if (org) body.provider_organization_name = $("elig-org").value.trim() || null;
+    else {
+      body.provider_first_name = $("elig-pfirst").value.trim() || null;
+      body.provider_last_name = $("elig-plast").value.trim() || null;
+    }
+    if ($("elig-dos").value) body.date_of_service = $("elig-dos").value;
+    return body;
+  }
+
+  function renderEligResult(data) {
+    const payer = data.payer || {};
+    const provider = data.provider || {};
+    const enroll = data.stedi_enrollment || {};
+    if (data.classification === "PAYER_AMBIGUOUS") {
+      const picks = (data.payer_matches || []).map((p, i) => `
+        <button type="button" class="chip" data-payer-pick="${i}">${text(p.name)} · ${text(p.primary_payer_id || p.stedi_payer_id)}${p.eligibility_support ? ` (${text(String(p.eligibility_support).toLowerCase().replaceAll("_", " "))})` : ""}</button>`).join("");
+      return `
+        <section class="card">
+          <div class="elig-result-head">${eligBadge(data.classification)}</div>
+          <p class="elig-explanation">${text(data.explanation)}</p>
+          <div class="payer-pick">${picks}</div>
+        </section>`;
+    }
+    const errors = (data.aaa_errors || []).map((e) => `
+      <tr>
+        <td><strong>${text(e.code)}</strong></td>
+        <td>${text(e.description)}</td>
+        <td>${text(e.level)}</td>
+        <td>${text(e.followup_action)}</td>
+        <td class="muted">${text(e.possible_resolutions)}</td>
+      </tr>`).join("");
+    const tiers = (data.network_tier_indicators || []).map((t) => `${escapeHtml(t.code)}${t.label ? ` (${escapeHtml(t.label)})` : ""}: ${escapeHtml(t.benefit_rows)} row(s)`).join("; ");
+    const planStatus = (data.plan_status || []).map((p) => `${p.status || p.status_code || ""}`).filter(Boolean);
+    const enrollRows = (enroll.enrollments || []).map((e) => `
+      <tr><td>${text(e.payer_name)}</td><td>${enrollmentBadge(e.status)}</td><td>${text((e.transactions || []).join(", "))}</td><td>${text(e.open_tasks)}</td></tr>`).join("");
+    const coverage = data.coverage_active === true ? badge("Active", "good") : data.coverage_active === false ? badge("Inactive", "warn") : badge("Unknown", "muted");
+    const mode = (data.stedi_meta || {}).application_mode;
+    return `
+      <section class="card">
+        <div class="card-head">
+          <div class="elig-result-head">
+            ${eligBadge(data.classification)}
+            <span class="muted">${text(payer.name)} · NPI ${text(data.npi)}</span>
+          </div>
+          <div class="meta-row">${mode ? badge(mode === "test" ? "Stedi test mode" : mode, mode === "test" ? "info" : "navy") : ""}</div>
+        </div>
+        <p class="elig-explanation">${text(data.explanation)}</p>
+        <dl class="dl-grid" style="margin-top:12px">
+          <div><dt>Coverage</dt><dd>${coverage}${planStatus.length ? ` <span class="muted">${text(planStatus.join(", "))}</span>` : ""}</dd></div>
+          <div><dt>Payer (response)</dt><dd>${text(data.payer_response_name || payer.name)}</dd></div>
+          <div><dt>Trading partner ID</dt><dd>${text(payer.trading_partner_service_id)} <span class="muted">Stedi ${text(payer.stedi_payer_id)}</span></dd></div>
+          <div><dt>Provider sent</dt><dd>${text(provider.name_sent)} <span class="muted">(${text(provider.type)})</span></dd></div>
+          <div><dt>Member</dt><dd>${text((data.member || {}).member_id_masked)}</dd></div>
+          <div><dt>Plan</dt><dd>${text((data.plan_names || []).join(", "))}</dd></div>
+          <div><dt>Benefit-tier network indicators</dt><dd>${tiers || "—"}</dd></div>
+          <div><dt>Checked</dt><dd>${text(data.checked_at ? new Date(data.checked_at).toLocaleString() : "")}</dd></div>
+        </dl>
+        ${data.network_tier_note && tiers ? `<p class="muted" style="margin-top:8px;font-size:0.84rem">${text(data.network_tier_note)}</p>` : ""}
+        ${errors ? `<div class="table-wrap" style="margin-top:14px"><table><thead><tr><th>AAA</th><th>Description</th><th>Level</th><th>Follow-up</th><th>Possible resolution</th></tr></thead><tbody>${errors}</tbody></table></div>` : ""}
+        <p class="elig-caveat">${text(data.caveat)}</p>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Stedi transaction enrollment</h2><div class="meta-row">${enroll.error ? badge("Error", "bad") : enrollRows ? badge(`${(enroll.enrollments || []).length} enrollment(s)`, "info") : badge("None for this payer", "muted")}</div></div>
+        ${enrollRows ? `<div class="table-wrap"><table><thead><tr><th>Payer</th><th>Status</th><th>Transactions</th><th>Open tasks</th></tr></thead><tbody>${enrollRows}</tbody></table></div>`
+          : `<p class="muted">${text(enroll.error || "No Stedi enrollments on file for this NPI and payer. Many payers require one before claims (837P) or ERAs (835) can flow through Stedi.")}</p>`}
+      </section>`;
+  }
+
+  function rememberElig(data) {
+    if (!data || !data.classification || data.classification === "PAYER_AMBIGUOUS") return;
+    const payer = data.payer || {};
+    // Only NPI, payer, classification, and timestamp. Never member data.
+    const entry = {
+      ts: new Date().toISOString(),
+      npi: data.npi,
+      payer: payer.stedi_payer_id || payer.trading_partner_service_id || "",
+      payer_name: payer.name || "",
+      classification: data.classification,
+    };
+    const items = loadEligHistory();
+    items.unshift(entry);
+    localStorage.setItem(ELIG_HISTORY_KEY, JSON.stringify(items.slice(0, HISTORY_LIMIT)));
+    renderEligHistory();
+  }
+
+  function loadEligHistory() {
+    try {
+      const raw = localStorage.getItem(ELIG_HISTORY_KEY);
+      const items = raw ? JSON.parse(raw) : [];
+      return Array.isArray(items) ? items : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function renderEligHistory() {
+    const root = $("elig-history-results");
+    if (!root) return;
+    const items = loadEligHistory();
+    if (!items.length) {
+      root.innerHTML = `<p class="empty">No readiness checks saved in this browser yet.</p>`;
+      return;
+    }
+    root.innerHTML = `
+      <div class="table-wrap"><table>
+        <thead><tr><th>When</th><th>NPI</th><th>Payer</th><th>Result</th><th></th></tr></thead>
+        <tbody>${items.map((row, i) => `
+          <tr>
+            <td>${text(row.ts ? new Date(row.ts).toLocaleString() : "")}</td>
+            <td>${text(row.npi)}</td>
+            <td>${text(row.payer_name || row.payer)} <span class="muted">${text(row.payer, "")}</span></td>
+            <td>${eligBadge(row.classification)}</td>
+            <td><button type="button" class="btn btn-ghost btn-sm" data-elig-history="${i}">Open</button></td>
+          </tr>`).join("")}</tbody>
+      </table></div>`;
+    root.querySelectorAll("[data-elig-history]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const row = items[Number(btn.getAttribute("data-elig-history"))];
+        if (!row) return;
+        openEligibility(row.npi, row.payer);
+      });
+    });
+  }
+
+  function clearMemberFields() {
+    ["elig-member", "elig-first", "elig-last", "elig-dob", "elig-dos"].forEach((id) => { $(id).value = ""; });
+  }
+
+  async function runEligibility(event) {
+    if (event) event.preventDefault();
+    const statusEl = $("elig-status");
+    const body = eligPayload();
+    if (!body.payer) { showStatus(statusEl, "Choose a payer.", "is-error"); return; }
+    const btn = $("elig-submit");
+    btn.disabled = true;
+    showStatus(statusEl, "Sending eligibility check to the payer… (can take up to a minute)", "");
+    $("elig-results").innerHTML = "";
+    try {
+      const data = await fetchJson("/eligibility-readiness", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      showStatus(statusEl, "", "");
+      $("elig-results").innerHTML = renderEligResult(data);
+      $("elig-results").querySelectorAll("[data-payer-pick]").forEach((b) => {
+        b.addEventListener("click", () => {
+          const p = (data.payer_matches || [])[Number(b.getAttribute("data-payer-pick"))];
+          if (!p) return;
+          eligState.payerOptions.set(payerOptionLabel(p), p);
+          $("elig-payer").value = payerOptionLabel(p);
+          updatePayerHint();
+          runEligibility();
+        });
+      });
+      rememberElig(data);
+    } catch (error) {
+      showStatus(statusEl, error.message || "Eligibility readiness check failed.", "is-error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function loadEligMocks() {
+    try {
+      const data = await fetchJson("/eligibility-readiness/mock-requests");
+      eligState.mocks = data;
+      $("elig-mocks").innerHTML = (data.requests || []).map((m, i) =>
+        `<button type="button" class="chip" data-elig-mock="${i}">${text(m.label)}</button>`).join("");
+      $("elig-mocks").querySelectorAll("[data-elig-mock]").forEach((b) => {
+        b.addEventListener("click", () => {
+          const m = data.requests[Number(b.getAttribute("data-elig-mock"))];
+          $("elig-npi").value = data.provider.npi;
+          eligState.prefillNpi = data.provider.npi;
+          setProviderType("organization");
+          $("elig-org").value = data.provider.organization_name;
+          $("elig-payer").value = m.payer;
+          $("elig-member").value = m.member_id;
+          $("elig-first").value = m.first_name;
+          $("elig-last").value = m.last_name;
+          $("elig-dob").value = m.date_of_birth;
+          $("elig-dos").value = "";
+          $("elig-stc").value = "30";
+          showStatus($("elig-status"), `Loaded Stedi mock: ${m.label} (expects ${ELIG_LABELS[m.expected] || m.expected}). Test API key only.`, "");
+        });
+      });
+    } catch {
+      $("elig-mocks").innerHTML = `<span class="muted">Mock list unavailable.</span>`;
+    }
+  }
+
+  function openEligibility(npi, payer) {
+    switchTab("eligibility");
+    if (npi) { $("elig-npi").value = npi; eligPrefill(true); }
+    if (payer) { $("elig-payer").value = payer; eligPayerSearch(); }
+    const url = new URL(window.location.href);
+    url.searchParams.set("tab", "eligibility");
+    if (npi) url.searchParams.set("npi", npi); else url.searchParams.delete("npi");
+    if (payer) url.searchParams.set("payer", payer); else url.searchParams.delete("payer");
+    window.history.replaceState(null, "", url.toString());
+    $("elig-member").focus();
+  }
+
+  function bindEligibility() {
+    $("elig-form").addEventListener("submit", runEligibility);
+    $("elig-npi").addEventListener("change", () => eligPrefill());
+    $("elig-npi").addEventListener("blur", () => eligPrefill());
+    $("elig-ptype").addEventListener("change", () => setProviderType($("elig-ptype").value));
+    $("elig-payer").addEventListener("input", () => {
+      clearTimeout(eligState.searchTimer);
+      updatePayerHint();
+      eligState.searchTimer = setTimeout(eligPayerSearch, 300);
+    });
+    $("elig-payer").addEventListener("change", updatePayerHint);
+    $("elig-clear-member").addEventListener("click", clearMemberFields);
+    setProviderType("individual");
+    loadEligMocks();
+    renderEligHistory();
+  }
+
   function switchTab(id) {
     document.querySelectorAll(".tab").forEach((tab) => {
       const active = tab.dataset.tab === id;
@@ -675,7 +991,7 @@
       panel.hidden = panel.id !== `panel-${id}`;
       panel.classList.toggle("is-active", !panel.hidden);
     });
-    if (id === "history") renderHistory();
+    if (id === "history") { renderHistory(); renderEligHistory(); }
     if (id === "payers" && state.payersCatalog) renderPayersTab(state.payersCatalog);
   }
 
@@ -705,7 +1021,9 @@
     });
     $("history-clear").addEventListener("click", () => {
       localStorage.removeItem(HISTORY_KEY);
+      localStorage.removeItem(ELIG_HISTORY_KEY);
       renderHistory();
+      renderEligHistory();
     });
     document.querySelectorAll("[data-close-drawer]").forEach((el) => el.addEventListener("click", closeDrawer));
     document.addEventListener("keydown", (event) => {
@@ -715,6 +1033,7 @@
 
   async function init() {
     bind();
+    bindEligibility();
     renderHistory();
     updateBatchCount();
     await refreshHealth();
@@ -725,7 +1044,11 @@
       showStatus($("payers-status"), error.message || "Unable to load payer catalog.", "is-error");
     }
     const qs = new URLSearchParams(window.location.search);
-    if (qs.get("npi")) {
+    if (qs.get("tab") === "eligibility") {
+      openEligibility(qs.get("npi") || "", qs.get("payer") || "");
+    } else if (qs.get("tab") && document.querySelector(`.tab[data-tab="${qs.get("tab")}"]`)) {
+      switchTab(qs.get("tab"));
+    } else if (qs.get("npi")) {
       $("npi").value = qs.get("npi");
       if (qs.get("payer")) $("payer").value = qs.get("payer");
       await runLookup();

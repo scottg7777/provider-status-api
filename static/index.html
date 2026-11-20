@@ -37,6 +37,7 @@
 
     <nav class="tabs" role="tablist" aria-label="Workspace">
       <button class="tab is-active" role="tab" aria-selected="true" data-tab="lookup">Single Lookup</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="eligibility">Eligibility Readiness</button>
       <button class="tab" role="tab" aria-selected="false" data-tab="batch">Batch Lookup</button>
       <button class="tab" role="tab" aria-selected="false" data-tab="payers">Supported Payers</button>
       <button class="tab" role="tab" aria-selected="false" data-tab="history">Recent History</button>
@@ -74,6 +75,94 @@
 
         <div id="lookup-status" class="status-line" hidden></div>
         <div id="lookup-results"></div>
+      </section>
+
+      <section id="panel-eligibility" class="panel" role="tabpanel" hidden>
+        <form id="elig-form" class="lookup-form card" autocomplete="off">
+          <div class="card-head">
+            <div>
+              <h2>Eligibility readiness check</h2>
+              <p class="muted">Sends one Stedi real-time eligibility check (270/271) under the provider's NPI for a real member on that plan, then reads whether the payer recognizes the provider.</p>
+            </div>
+          </div>
+          <div class="phi-notice" role="note">
+            <strong>PHI notice:</strong> member ID, name, and date of birth are sent to the payer through Stedi for this one check only. They are not logged, not stored on the server, and not saved in this browser's history. Use only members you're authorized to check.
+          </div>
+          <fieldset class="elig-group">
+            <legend>Provider &amp; payer</legend>
+            <div class="form-grid elig-grid">
+              <label class="field">
+                <span>Provider NPI</span>
+                <input id="elig-npi" name="npi" inputmode="numeric" maxlength="10" pattern="\d{10}" placeholder="10-digit NPI" required>
+              </label>
+              <label class="field">
+                <span>Payer <em>(Stedi search)</em></span>
+                <input id="elig-payer" name="payer" list="elig-payer-list" placeholder="Type a payer name or ID (e.g. Anthem Ohio)" required>
+                <datalist id="elig-payer-list"></datalist>
+                <small id="elig-payer-hint" class="muted field-hint"></small>
+              </label>
+              <label class="field">
+                <span>Provider type</span>
+                <select id="elig-ptype">
+                  <option value="individual">Individual (first / last)</option>
+                  <option value="organization">Organization</option>
+                </select>
+              </label>
+              <label class="field elig-org" hidden>
+                <span>Organization name</span>
+                <input id="elig-org" maxlength="120" placeholder="Prefilled from NPPES">
+              </label>
+              <label class="field elig-person">
+                <span>Provider first name</span>
+                <input id="elig-pfirst" maxlength="60" placeholder="Prefilled from NPPES">
+              </label>
+              <label class="field elig-person">
+                <span>Provider last name</span>
+                <input id="elig-plast" maxlength="60" placeholder="Prefilled from NPPES">
+              </label>
+            </div>
+          </fieldset>
+          <fieldset class="elig-group">
+            <legend>Member <em>(not stored)</em></legend>
+            <div class="form-grid elig-grid">
+              <label class="field">
+                <span>Member ID</span>
+                <input id="elig-member" maxlength="80" required autocomplete="off" spellcheck="false">
+              </label>
+              <label class="field">
+                <span>First name</span>
+                <input id="elig-first" maxlength="60" required autocomplete="off">
+              </label>
+              <label class="field">
+                <span>Last name</span>
+                <input id="elig-last" maxlength="60" required autocomplete="off">
+              </label>
+              <label class="field">
+                <span>Date of birth</span>
+                <input id="elig-dob" type="date" required autocomplete="off">
+              </label>
+              <label class="field">
+                <span>Date of service <em>(optional)</em></span>
+                <input id="elig-dos" type="date">
+              </label>
+              <label class="field">
+                <span>Service type code</span>
+                <input id="elig-stc" maxlength="3" value="30" placeholder="30">
+              </label>
+            </div>
+          </fieldset>
+          <div class="row-actions">
+            <details class="mock-picker">
+              <summary>Stedi mock requests (test API key only)</summary>
+              <p class="muted">Documented PHI-free test values. They only return mock data with a Stedi <strong>test</strong> API key; with a production key they would go to the real payer.</p>
+              <div id="elig-mocks" class="samples"></div>
+            </details>
+            <button type="button" class="btn btn-ghost" id="elig-clear-member">Clear member</button>
+            <button type="submit" class="btn btn-primary" id="elig-submit">Run readiness check</button>
+          </div>
+        </form>
+        <div id="elig-status" class="status-line" hidden></div>
+        <div id="elig-results"></div>
       </section>
 
       <section id="panel-batch" class="panel" role="tabpanel" hidden>
@@ -115,6 +204,9 @@
             <button type="button" id="history-clear" class="btn btn-ghost">Clear history</button>
           </div>
           <div id="history-results"></div>
+          <h3 class="history-subhead">Eligibility readiness checks</h3>
+          <p class="muted">Only NPI, payer, result, and time are saved. Member data is never stored.</p>
+          <div id="elig-history-results"></div>
         </div>
       </section>
     </main>

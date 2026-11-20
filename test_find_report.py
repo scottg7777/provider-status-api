@@ -153,6 +153,56 @@ async def test_affiliated_by_address_phone_and_official():
     assert "same practice address (same suite)" in by["1962335943"]["affiliation_reasons"]
 
 
+
+async def test_affiliated_tiers_second_location_and_building_tenants():
+    org = ns.summarize_result(_nppes_row("1477941532", org="BABEL THERAPY, PLLC", official=("SARAH", "LEA"),
+                                         city="CYPRESS", state="TX", address="17820 MOUND RD STE F",
+                                         zip_="774334903", phone="936-703-5064"))
+    assert org["primary_taxonomy"]["description"] == "Dermatology"
+    owner = _nppes_row("1225386261", first="SARAH", last="LEA", city="CYPRESS", state="TX",
+                       address="17820 MOUND RD STE F", zip_="774334903", phone="936-703-5064")
+    remote = _nppes_row("1831807759", first="BRIANNA", last="FORD", city="TOMBALL", state="TX",
+                        address="12075 SPRING CYPRESS RD STE A", zip_="773772301", phone="936-703-5064")
+    second_site = _nppes_row("1235992959", first="KIMBERLY", last="MOORE", city="TOMBALL", state="TX",
+                             address="12075 SPRING CYPRESS RD STE A", zip_="773772301", phone="000-000-0000")
+    neighbor_same_spec = _nppes_row("1861359705", first="ELIZABETH", last="PARSONS", city="CYPRESS", state="TX",
+                                    address="17820 MOUND RD STE C", zip_="774334903", phone="281-246-0004")
+    tenant = _nppes_row("1285333989", first="OTHER", last="TENANT", city="CYPRESS", state="TX",
+                        address="17820 MOUND RD STE B", zip_="774334903", phone="281-720-7210")
+    tenant["taxonomies"] = [{"code": "101YP2500X", "desc": "Counselor, Professional", "primary": True}]
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = {k: v[0] for k, v in parse_qs(urlparse(str(request.url)).query).items()}
+        seen.append(params)
+        if params.get("postal_code") == "774334903":
+            return httpx.Response(200, json={"results": [owner, neighbor_same_spec, tenant]})
+        if params.get("postal_code") == "773772301":
+            return httpx.Response(200, json={"results": [second_site]})
+        if params.get("taxonomy_description") and params.get("city") == "CYPRESS" and params.get("skip", "0") == "0":
+            return httpx.Response(200, json={"results": [remote]})
+        if params.get("first_name") == "SARAH":
+            return httpx.Response(200, json={"results": [owner]})
+        return httpx.Response(200, json={"results": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        out = await ns.find_affiliated(client, org)
+    by = {r["npi"]: r for r in out["results"]}
+    assert by["1225386261"]["affiliation_tier"] == "strong"
+    assert by["1831807759"]["affiliation_tier"] == "strong"          # same phone, other city
+    assert by["1235992959"]["affiliation_tier"] == "possible"        # found via second hop
+    assert "1235992959" in by and any("773772301" == p.get("postal_code") for p in seen)
+    assert by["1861359705"]["affiliation_tier"] == "possible"        # same building + same specialty
+    assert "1285333989" not in by and out["other_tenants_count"] == 1
+    assert [r["affiliation_tier"] for r in out["results"]][:2] == ["strong", "strong"]
+    assert out["linked_addresses"] == ["12075 SPRING CYPRESS RD STE A"]
+
+
+def test_taxonomy_description_trailing_punctuation_stripped():
+    row = _nppes_row("1225386261", first="SARAH", last="LEA")
+    row["taxonomies"] = [{"code": "235Z00000X", "desc": "Speech-Language Pathologist,  ", "primary": True}]
+    assert ns.summarize_result(row)["primary_taxonomy"]["description"] == "Speech-Language Pathologist"
+
 # ---------- extra public-source clients ----------
 
 def _cms_transport(rows_by_dataset: dict[str, list[dict[str, Any]]]):
@@ -377,3 +427,38 @@ async def test_live_affiliated_aeterna():
         org = (await ns.search_by_name(client, "Aeterna Aesthetics", state="OH"))["results"][0]
         out = await ns.find_affiliated(client, org)
     assert "1699443499" in {r["npi"] for r in out["results"]}
+
+
+def test_revalidation_past_due_and_soon():
+    from datetime import date
+    f = readiness.revalidation_flags(["2025-06-30", "01/15/2027", "TBD", "2030-01-01"], today=date(2026, 11, 20))
+    assert f == {"past_due": ["2025-06-30"], "due_soon": ["2027-01-15"]}
+    none = {"reassignments": [], "enrollments": []}
+    past = readiness.medicare_verdict(pecos=_pecos(), opt_out={"active_opt_out": False}, reassign=none,
+                                      revalidation={"enrollments": [{"revalidation_due_date": "2025-06-30"}], "source": "v"},
+                                      is_org=True, group_members=None, today=date(2026, 11, 20))
+    assert past["status"] == readiness.LIKELY_READY
+    assert any("has passed" in r for r in past["reasons"])
+    indiv = readiness.medicare_verdict(pecos=_pecos(), opt_out={"active_opt_out": False},
+                                       reassign={"reassignments": [{"group_name": "G", "individual_due_date": "12/31/2026"}]},
+                                       revalidation={"enrollments": []}, is_org=False, group_members=None, today=date(2026, 11, 20))
+    assert indiv["status"] == readiness.READY and any("due soon: 2026-12-31" in r for r in indiv["reasons"])
+
+
+async def test_group_context_flags_reassignment_elsewhere(monkeypatch):
+    async def fake_pecos(client, npi):
+        return {"enrolled": True, "name": "BABEL THERAPY, PLLC", "enrollments": [{"pac_id": "6800111220"}]}
+    monkeypatch.setattr(readiness, "lookup_pecos", fake_pecos)
+    other = {"reassignments": [{"group_pac_id": "143711499", "group_name": "Blessings Communication, Pllc"}]}
+    ctx = await readiness._group_context(None, "1477941532", other)
+    assert ctx["reassigns_to_group"] is False and ctx["other_groups"] == ["Blessings Communication, Pllc"]
+    ok = await readiness._group_context(None, "1477941532", {"reassignments": [{"group_pac_id": "6800111220", "group_name": "Babel"}]})
+    assert ok["reassigns_to_group"] is True
+
+
+def test_readiness_report_rejects_bad_group_npi():
+    from fastapi.testclient import TestClient
+    import app as app_module
+    with TestClient(app_module.app) as client:
+        r = client.get("/readiness-report", params={"npi": "1225386261", "group_npi": "123"})
+    assert r.status_code == 400

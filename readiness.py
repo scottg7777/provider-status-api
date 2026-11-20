@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -19,6 +19,7 @@ import httpx
 from clients import cms_extra
 from clients import stedi as stedi_client
 from clients.leie import LEIE
+from clients.pecos import lookup_pecos
 from clients.registry import LIVE_FHIR_PAYERS, NPPES_URL, PECOS_DATA_URL
 from service import lookup_provider_status
 
@@ -97,9 +98,50 @@ def _support_note(support: dict[str, Any] | None) -> list[str]:
     return notes
 
 
+REVALIDATION_SOON_DAYS = 120
+# Taxonomy prefixes for provider types that can't order/refer in Medicare anyway (SLP, PT, OT,
+# counselors, social workers, MFTs), so the Order & Referring warning is noise for them.
+NON_ORDERING_TAXONOMY_PREFIXES = ("235Z", "225", "2252", "101Y", "1041", "106H", "2355")
+
+# FHIR directories that only cover one state's market. Rows are dropped for providers elsewhere.
+PAYER_STATE_SCOPE = {"bcbsri": "RI"}
+
+
+def _parse_due(raw: Any) -> date | None:
+    raw = str(raw or "").strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def revalidation_flags(due_dates: list[Any], today: date | None = None) -> dict[str, list[str]]:
+    """Split CMS revalidation due dates into past-due and due-soon (ISO strings)."""
+    today = today or date.today()
+    past, soon = set(), set()
+    for raw in due_dates:
+        d = _parse_due(raw)
+        if not d:
+            continue
+        if d < today:
+            past.add(d.isoformat())
+        elif d <= today + timedelta(days=REVALIDATION_SOON_DAYS):
+            soon.add(d.isoformat())
+    return {"past_due": sorted(past), "due_soon": sorted(soon)}
+
+
+def _due_dates(revalidation: dict[str, Any], reassign: dict[str, Any], is_org: bool) -> list[str]:
+    due = [e.get("adjusted_due_date") or e.get("revalidation_due_date") for e in revalidation.get("enrollments") or []]
+    if not is_org:
+        due += [r.get("individual_due_date") for r in reassign.get("reassignments") or []]
+    return [d for d in due if d and str(d).upper() != "TBD"]
+
+
 def medicare_verdict(
     *, pecos: dict[str, Any], opt_out: dict[str, Any], reassign: dict[str, Any], revalidation: dict[str, Any],
-    is_org: bool, group_members: dict[str, Any] | None,
+    is_org: bool, group_members: dict[str, Any] | None, today: date | None = None,
 ) -> dict[str, Any]:
     reasons: list[str] = []
     sources = [PECOS_DATA_URL, opt_out.get("source")]
@@ -117,12 +159,17 @@ def medicare_verdict(
         if is_org and group_members and group_members.get("members"):
             reasons.append(f"{len(group_members['members'])} individual(s) reassign benefits to this group")
             sources.append(group_members.get("source"))
-        due = [e.get("adjusted_due_date") or e.get("revalidation_due_date") for e in revalidation.get("enrollments") or []]
-        due = [d for d in due if d and d != "TBD"]
-        if due:
-            reasons.append(f"Revalidation due: {', '.join(sorted(set(due)))}")
+        flags = revalidation_flags(_due_dates(revalidation, reassign, is_org), today)
+        status = READY
+        if flags["past_due"]:
+            status = LIKELY_READY
+            reasons.append(f"Revalidation due date {', '.join(flags['past_due'])} has passed on the CMS list. "
+                           "Confirm the revalidation was filed; CMS can deactivate billing privileges")
             sources.append(revalidation.get("source"))
-        return {"status": READY, "reasons": reasons, "sources": sources}
+        elif flags["due_soon"]:
+            reasons.append(f"Revalidation due soon: {', '.join(flags['due_soon'])}")
+            sources.append(revalidation.get("source"))
+        return {"status": status, "reasons": reasons, "sources": sources}
     reasons.append("Not in the Medicare FFS PECOS public enrollment file")
     if not is_org and not (reassign.get("reassignments")):
         reasons.append("No Medicare reassignment on file")
@@ -228,7 +275,25 @@ async def _leie_lookup(client: httpx.AsyncClient, provider_task: asyncio.Task) -
     )
 
 
-async def build_report(client: httpx.AsyncClient, npi: str) -> dict[str, Any]:
+async def _group_context(client: httpx.AsyncClient, group_npi: str, reassign: dict[str, Any]) -> dict[str, Any]:
+    """Does this individual reassign Medicare benefits to the given group NPI?"""
+    gp = await lookup_pecos(client, group_npi)
+    pacs = {e.get("pac_id") for e in gp.get("enrollments") or [] if e.get("pac_id")}
+    rows = reassign.get("reassignments") or []
+    to_group = [r for r in rows if r.get("group_pac_id") in pacs]
+    others = sorted({r.get("group_name") or r.get("group_pac_id") for r in rows if r.get("group_pac_id") not in pacs} - {None})
+    return {
+        "group_npi": group_npi,
+        "group_name": gp.get("name"),
+        "group_enrolled": bool(gp.get("enrolled")),
+        "group_pac_ids": sorted(pacs),
+        "reassigns_to_group": bool(to_group),
+        "other_groups": others,
+        "error": gp.get("error") or reassign.get("error"),
+    }
+
+
+async def build_report(client: httpx.AsyncClient, npi: str, *, group_npi: str | None = None) -> dict[str, Any]:
     checked_at = datetime.now(timezone.utc).isoformat()
     status_task = asyncio.create_task(lookup_provider_status(client, npi))
 
@@ -269,11 +334,20 @@ async def build_report(client: httpx.AsyncClient, npi: str) -> dict[str, Any]:
         pecos=pecos, opt_out=opt_out, reassign=reassign, revalidation=revalidation,
         is_org=is_org, group_members=group_members,
     )
+    group_ctx = None
+    if group_npi and not is_org and group_npi != npi:
+        group_ctx = await _group_context(client, group_npi, reassign)
     rows.append({"payer": "Medicare (FFS)", "payer_key": "medicare", "eligibility_payer": "CMS", **med})
 
     used: set[str] = set()
+    prov_states = {a.get("state") for a in (provider.get("practice_addresses") or []) if a.get("state")}
+    out_of_area: list[str] = []
     for fhir in (status.get("network_status") or {}).get("results") or []:
         pid = fhir.get("payer_id")
+        scope = PAYER_STATE_SCOPE.get(pid)
+        if scope and prov_states and scope not in prov_states and not fhir.get("found"):
+            out_of_area.append(f"{fhir.get('payer_name') or pid} ({scope} only)")
+            continue
         matched = [e for e in enrollments if _enrollment_matches_fhir(e, pid)]
         used.update(e.get("id") for e in matched)
         sid = FHIR_TO_STEDI_PAYER.get(pid) or next(((e.get("payer") or {}).get("stedi_payer_id") for e in matched), None)
@@ -313,10 +387,26 @@ async def build_report(client: httpx.AsyncClient, npi: str) -> dict[str, Any]:
         warnings.append("Possible OIG LEIE name match with no NPI on the exclusion record. Verify at exclusions.oig.hhs.gov.")
     if is_org and not pecos.get("enrolled"):
         warnings.append("Group NPI isn't in Medicare PECOS. A group billing Medicare under its own NPI needs its own enrollment (855B).")
-    if order_ref.get("found") is False and not is_org:
+    tax_code = str(((provider.get("primary_taxonomy") or {}).get("code")) or "")
+    if order_ref.get("found") is False and not is_org and not tax_code.startswith(NON_ORDERING_TAXONOMY_PREFIXES):
         warnings.append("Not on the Medicare Order and Referring list.")
     if leie.get("error"):
         warnings.append(leie["error"])
+    if pecos.get("enrolled"):
+        flags = revalidation_flags(_due_dates(revalidation, reassign, is_org))
+        if flags["past_due"]:
+            warnings.append(f"Medicare revalidation due date {', '.join(flags['past_due'])} has passed on the CMS list. Confirm the 855 revalidation was filed and approved.")
+        elif flags["due_soon"]:
+            warnings.append(f"Medicare revalidation due within {REVALIDATION_SOON_DAYS} days: {', '.join(flags['due_soon'])}.")
+    if group_ctx and not group_ctx.get("error"):
+        gname = group_ctx.get("group_name") or group_ctx["group_npi"]
+        if not group_ctx["group_enrolled"]:
+            warnings.append(f"Group {gname} isn't in Medicare PECOS, so a reassignment to it can't be confirmed.")
+        elif not group_ctx["reassigns_to_group"]:
+            msg = f"No Medicare reassignment to {gname} on file"
+            if group_ctx["other_groups"]:
+                msg += "; reassigns to " + "; ".join(group_ctx["other_groups"][:5]) + " instead"
+            warnings.append(msg + ". Claims billed under the group NPI for this provider will deny until an 855R is filed.")
 
     return {
         "npi": npi,
@@ -334,12 +424,14 @@ async def build_report(client: httpx.AsyncClient, npi: str) -> dict[str, Any]:
             "reassignment": reassign,
             "group_reassignment": group_members,
             "revalidation": revalidation,
+            "group_context": group_ctx,
             "oig_leie": leie,
             "fhir_directories": status.get("network_status"),
             "stedi_enrollment": stedi,
             "stedi_payer_support": support,
         },
         "skipped_sources": [
+            *([{"name": "Out-of-area payer directories", "reason": "Not shown for this provider's state: " + ", ".join(out_of_area)}] if out_of_area else []),
             {"name": "SAM.gov exclusions", "reason": "Requires a SAM.gov API key (free but needs account registration); not configured."},
             {"name": "State Medicaid exclusion / enrollment lists", "reason": "Vary by state with no common free API."},
             {"name": "Aetna, Anthem/Elevance, Kaiser and other directories", "reason": "Their FHIR directories need OAuth/registration (see /payers)."},

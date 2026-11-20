@@ -190,6 +190,21 @@ def _location(row: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _all_addresses(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """Primary location + mailing + NPPES secondary practice locations."""
+    out = []
+    for a in (row.get("addresses") or []) + (row.get("practiceLocations") or []):
+        out.append({
+            "purpose": (a.get("address_purpose") or "").upper() or None,
+            "address_1": a.get("address_1"),
+            "city": a.get("city"),
+            "state": a.get("state"),
+            "postal_code": a.get("postal_code"),
+            "telephone": a.get("telephone_number"),
+        })
+    return out
+
+
 def summarize_result(row: dict[str, Any]) -> dict[str, Any]:
     basic = row.get("basic") or {}
     etype = row.get("enumeration_type")
@@ -224,6 +239,7 @@ def summarize_result(row: dict[str, Any]) -> dict[str, Any]:
         "other_names": other_names,
         "primary_taxonomy": tax,
         "practice_address": _location(row),
+        "all_addresses": _all_addresses(row),
         "enumeration_date": basic.get("enumeration_date"),
         "last_updated": basic.get("last_updated"),
         "status": status or None,
@@ -341,64 +357,159 @@ def _digits(value: Any) -> str:
     return re.sub(r"\D", "", str(value or ""))
 
 
+def _specialty_key(item: dict[str, Any]) -> str:
+    """First word of the primary taxonomy description: 'Speech-Language Pathologist' -> 'SPEECH'."""
+    desc = clean_text(((item.get("primary_taxonomy") or {}).get("description")) or "")
+    words = re.findall(r"[A-Z]+", desc)
+    return words[0] if words and len(words[0]) >= 4 else ""
+
+
 async def find_affiliated(client: httpx.AsyncClient, org: dict[str, Any], *, limit: int = 50) -> dict[str, Any]:
-    """Individual NPIs likely affiliated with an organization (same practice address/phone,
-    or the authorized official). ``org`` is a summarize_result() dict."""
-    addr = org.get("practice_address") or {}
-    zip_full = _digits(addr.get("postal_code"))
-    street = _street_key(addr.get("address_1"))
-    phone = _digits(addr.get("telephone"))
-    tasks = []
-    labels = []
-    if len(zip_full) >= 5:
-        tasks.append(nppes_search(client, {"enumeration_type": "NPI-1", "postal_code": zip_full}, limit=200))
-        labels.append("zip")
-    auth = org.get("authorized_official") or {}
-    if auth.get("last_name") and auth.get("first_name"):
-        params = {"enumeration_type": "NPI-1", "first_name": auth["first_name"], "last_name": auth["last_name"]}
-        if addr.get("state"):
-            params["state"] = addr["state"]
-        tasks.append(nppes_search(client, params, limit=20))
-        labels.append("official")
-    results = await asyncio.gather(*tasks)
+    """Individual NPIs likely affiliated with an organization. ``org`` is a summarize_result() dict.
+
+    Searches every org address (practice, mailing, NPPES secondary locations) by 9-digit ZIP,
+    plus same-specialty individuals in the org's cities, plus the authorized official.
+    Tiers: "strong" (same phone, same suite, authorized official), "possible" (same building and
+    same specialty, or official's name at another address). Other tenants of a shared building
+    are counted but not listed."""
+    addrs = [a for a in (org.get("all_addresses") or []) if a.get("address_1")]
+    if not addrs and org.get("practice_address"):
+        addrs = [org["practice_address"]]
+    primary = org.get("practice_address") or (addrs[0] if addrs else {})
+    lines = {clean_text(a.get("address_1") or "") for a in addrs}
+    streets = {(_street_key(a.get("address_1")), _digits(a.get("postal_code"))[:5]) for a in addrs}
+    phones = {_digits(a.get("telephone"))[-10:] for a in addrs if len(_digits(a.get("telephone"))) >= 10}
+    zips = sorted({_digits(a.get("postal_code")) for a in addrs if len(_digits(a.get("postal_code"))) >= 5})
+    places = sorted({(clean_text(a.get("city") or ""), a.get("state")) for a in addrs if a.get("city") and a.get("state")})
+    specialty = _specialty_key(org)
+
     people: dict[str, dict[str, Any]] = {}
-    errors = []
-    for label, (rows, error) in zip(labels, results):
-        if error:
-            errors.append(error)
+    other_tenants: set[str] = set()
+    errors: list[str] = []
+    searched_zips: set[str] = set()
+    searched_places: set[tuple] = set()
+
+    def queue(zip_list, place_list, tasks, labels):
+        for z in zip_list:
+            if z in searched_zips:
+                continue
+            searched_zips.add(z)
+            tasks.append(nppes_search(client, {"enumeration_type": "NPI-1", "postal_code": z}, limit=200))
+            labels.append("zip")
+        if specialty:
+            for city, state in place_list:
+                if (city, state) in searched_places:
+                    continue
+                searched_places.add((city, state))
+                for skip in (0, 200, 400):
+                    tasks.append(nppes_search(client, {"enumeration_type": "NPI-1", "city": city, "state": state,
+                                                       "taxonomy_description": specialty.title() + "*"}, limit=200, skip=skip))
+                    labels.append("specialty")
+
+    def absorb(label, rows, hop):
         for row in rows:
             item = summarize_result(row)
-            reasons: list[str] = []
-            for a in row.get("addresses") or []:
-                if street and _street_key(a.get("address_1")) == street and _digits(a.get("postal_code"))[:5] == zip_full[:5]:
-                    reasons.append("same practice address" if (a.get("address_purpose") or "").upper() == "LOCATION" else "same mailing address")
-                    if clean_text(a.get("address_1") or "") == clean_text(addr.get("address_1") or ""):
-                        reasons[-1] += " (same suite)"
-                if phone and _digits(a.get("telephone_number")) == phone:
-                    reasons.append("same phone")
+            strong: list[str] = []
+            weak: list[str] = []
+            for a in item["all_addresses"]:
+                kind = "practice" if a.get("purpose") == "LOCATION" else "mailing"
+                line = clean_text(a.get("address_1") or "")
+                if line in lines:
+                    strong.append(f"same {kind} address (same suite)")
+                elif line in linked_lines:
+                    weak.append(f"{kind} address shared with a phone-matched provider")
+                elif (_street_key(a.get("address_1")), _digits(a.get("postal_code"))[:5]) in streets:
+                    weak.append(f"same {kind} address (same building)")
+                if phones and _digits(a.get("telephone"))[-10:] in phones:
+                    strong.append("same phone")
+            same_spec = bool(specialty) and _specialty_key(item) == specialty
             if label == "official":
-                ia = item.get("practice_address") or {}
-                if _street_key(ia.get("address_1")) == street or reasons:
-                    reasons.append("authorized official of the organization")
+                if strong or weak:
+                    strong.append("authorized official of the organization")
                 else:
-                    reasons.append("same name as the organization's authorized official (different address)")
-            if not reasons:
+                    weak.append("same name as the organization's authorized official (different address)")
+            if strong:
+                tier = "strong"
+            elif weak and (same_spec or label == "official"):
+                tier = "possible"
+            else:
+                if weak:
+                    other_tenants.add(item["npi"])
                 continue
+            reasons = strong + weak + (["same specialty"] if same_spec else [])
             existing = people.get(item["npi"])
             if existing:
                 existing["affiliation_reasons"] = sorted(set(existing["affiliation_reasons"] + reasons))
+                if tier == "strong":
+                    existing["affiliation_tier"] = "strong"
             else:
                 item["affiliation_reasons"] = sorted(set(reasons))
+                item["affiliation_tier"] = tier
                 people[item["npi"]] = item
-    ranked = sorted(
-        people.values(),
-        key=lambda p: (-sum(2 if "suite" in r or "official of" in r else 1 for r in p["affiliation_reasons"]), p.get("name") or ""),
-    )
+
+    linked_lines: set[str] = set()
+    tasks: list[Any] = []
+    labels: list[str] = []
+    queue(zips[:4], places[:3], tasks, labels)
+    auth = org.get("authorized_official") or {}
+    if auth.get("last_name") and auth.get("first_name"):
+        params = {"enumeration_type": "NPI-1", "first_name": auth["first_name"], "last_name": auth["last_name"]}
+        if primary.get("state"):
+            params["state"] = primary["state"]
+        tasks.append(nppes_search(client, params, limit=20))
+        labels.append("official")
+    for label, (rows, error) in zip(labels, await asyncio.gather(*tasks)):
+        if error and error not in errors:
+            errors.append(error)
+        absorb(label, rows, 1)
+
+    # Second hop: other locations where a strong match uses the org's phone (e.g. a second
+    # clinic not listed on the org NPI). Search those ZIPs/cities too.
+    hop_zips, hop_places = [], []
+    for p in list(people.values()):
+        if "same phone" not in p["affiliation_reasons"]:
+            continue
+        for a in p["all_addresses"]:
+            line = clean_text(a.get("address_1") or "")
+            if line in lines or _digits(a.get("telephone"))[-10:] not in phones:
+                continue
+            linked_lines.add(line)
+            z = _digits(a.get("postal_code"))
+            if len(z) >= 5:
+                hop_zips.append(z)
+            if a.get("city") and a.get("state"):
+                hop_places.append((clean_text(a["city"]), a["state"]))
+    tasks, labels = [], []
+    queue(sorted(set(hop_zips))[:3], sorted(set(hop_places))[:2], tasks, labels)
+    for label, (rows, error) in zip(labels, await asyncio.gather(*tasks)):
+        if error and error not in errors:
+            errors.append(error)
+        absorb(label, rows, 2)
+    other_tenants -= set(people)
+
+    def rank(p: dict[str, Any]) -> tuple:
+        rs = p["affiliation_reasons"]
+        pts = sum(3 if ("suite" in r or "phone" in r or "official of" in r) else 1 for r in rs)
+        return (p["affiliation_tier"] != "strong", -pts, p.get("name") or "")
+
+    ranked = sorted(people.values(), key=rank)
     return {
         "organization_npi": org.get("npi"),
         "organization_name": org.get("name"),
-        "basis": {"street": street or None, "postal_code": zip_full or None, "phone": phone or None},
+        "basis": {
+            "addresses": sorted(lines),
+            "postal_codes": zips,
+            "phones": sorted(phones),
+            "specialty": specialty or None,
+            # kept for older clients
+            "street": _street_key(primary.get("address_1")) or None,
+            "postal_code": _digits(primary.get("postal_code")) or None,
+            "phone": _digits(primary.get("telephone")) or None,
+        },
+        "linked_addresses": sorted(linked_lines),
         "results": ranked[:limit],
+        "other_tenants_count": len(other_tenants),
         "errors": errors,
-        "note": "Likely affiliations from NPPES address/phone matches. NPPES doesn't record employment, so verify.",
+        "note": "Likely affiliations from NPPES address/phone/specialty matches. NPPES doesn't record "
+                "employment, so verify. Other providers who only share the building are counted, not listed.",
     }

@@ -1041,7 +1041,7 @@
     root.querySelectorAll("[data-select-npi]").forEach((b) => {
       if (b.dataset.bound) return;
       b.dataset.bound = "1";
-      b.addEventListener("click", () => runReport(b.getAttribute("data-select-npi")));
+      b.addEventListener("click", () => runReport(b.getAttribute("data-select-npi"), b.getAttribute("data-group-npi") || ""));
     });
   }
 
@@ -1057,11 +1057,11 @@
       const data = await fetchJson(`/search/affiliated?npi=${encodeURIComponent(npi)}`);
       box.dataset.loaded = "1";
       const rows = (data.results || []).map((p) => `
-        <li><strong>${text(p.name)}</strong>${p.credential ? ` ${text(p.credential)}` : ""} · NPI ${text(p.npi)} · ${text((p.primary_taxonomy || {}).description)}
+        <li><span class="badge ${p.affiliation_tier === "strong" ? "badge-ok" : "badge-warn"}">${p.affiliation_tier === "strong" ? "Strong" : "Possible"}</span> <strong>${text(p.name)}</strong>${p.credential ? ` ${text(p.credential)}` : ""} · NPI ${text(p.npi)} · ${text((p.primary_taxonomy || {}).description)}
           <br><span class="muted">${text((p.affiliation_reasons || []).join(" · "))}</span>
-          <button type="button" class="btn btn-ghost btn-sm" data-select-npi="${escapeHtml(p.npi)}">Select</button></li>`).join("");
+          <button type="button" class="btn btn-ghost btn-sm" data-select-npi="${escapeHtml(p.npi)}" data-group-npi="${escapeHtml(npi)}">Select</button></li>`).join("");
       box.innerHTML = rows
-        ? `<div class="muted">${text(data.note)}</div><ul>${rows}</ul>`
+        ? `<div class="muted">${text(data.note)}</div><ul>${rows}</ul>${data.other_tenants_count ? `<div class="muted">${text(String(data.other_tenants_count))} other provider(s) share the building but not the suite, phone or specialty (not listed).</div>` : ""}`
         : `<span class="muted">No individual NPIs found at the same practice address or phone.</span>`;
       bindSelectButtons(box);
     } catch (error) {
@@ -1227,8 +1227,9 @@
     });
   }
 
-  async function runReport(npi) {
+  async function runReport(npi, groupNpi) {
     if (!/^\d{10}$/.test(String(npi || ""))) return;
+    const group = /^\d{10}$/.test(String(groupNpi || "")) ? String(groupNpi) : "";
     switchTab("find");
     setStep(3);
     const statusEl = $("report-status");
@@ -1237,9 +1238,10 @@
     const url = new URL(window.location.href);
     url.search = "";
     url.searchParams.set("npi", npi);
+    if (group) url.searchParams.set("group", group);
     window.history.replaceState(null, "", url.toString());
     try {
-      const data = await fetchJson(`/readiness-report?npi=${encodeURIComponent(npi)}`);
+      const data = await fetchJson(`/readiness-report?npi=${encodeURIComponent(npi)}${group ? `&group_npi=${encodeURIComponent(group)}` : ""}`);
       findState.lastReport = data;
       showStatus(statusEl, "", "");
       const root = $("report-results");
@@ -1341,7 +1343,7 @@
         await runFind();
       }
     } else if (!tab && qs.get("npi")) {
-      await runReport(qs.get("npi").trim());
+      await runReport(qs.get("npi").trim(), (qs.get("group") || "").trim());
     } else if (tab === "lookup" && qs.get("npi")) {
       switchTab("lookup");
       $("npi").value = qs.get("npi");

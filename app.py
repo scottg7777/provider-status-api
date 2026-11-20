@@ -223,7 +223,7 @@ async def search_affiliated(request: Request, npi: str = Query(...)) -> dict[str
 
 
 @app.get("/readiness-report")
-async def readiness_report(request: Request, npi: str = Query(...)) -> dict[str, Any]:
+async def readiness_report(request: Request, npi: str = Query(...), group_npi: str | None = Query(None)) -> dict[str, Any]:
     """Readiness-to-bill report: all public sources + Stedi enrollment/payer support, with verdicts."""
     from readiness import build_report
 
@@ -231,4 +231,9 @@ async def readiness_report(request: Request, npi: str = Query(...)) -> dict[str,
         npi = validate_npi(npi)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await build_report(request.app.state.http, npi)
+    if group_npi:
+        try:
+            group_npi = validate_npi(group_npi)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"group_npi: {exc}") from exc
+    return await build_report(request.app.state.http, npi, group_npi=group_npi)

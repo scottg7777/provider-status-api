@@ -25,6 +25,11 @@ def _display_name(basic: dict[str, Any], enumeration_type: str | None) -> str | 
     return name or None
 
 
+def _clean_desc(value: Any) -> Any:
+    """NPPES pads some descriptions, e.g. 'Speech-Language Pathologist,  '."""
+    return value.strip().rstrip(",").strip() if isinstance(value, str) else value
+
+
 def _primary_taxonomy(taxonomies: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not taxonomies:
         return None
@@ -32,7 +37,7 @@ def _primary_taxonomy(taxonomies: list[dict[str, Any]]) -> dict[str, Any] | None
         if row.get("primary") is True or str(row.get("primary")).lower() in {"true", "y", "yes"}:
             return {
                 "code": row.get("code"),
-                "description": row.get("desc") or row.get("taxonomy_description"),
+                "description": _clean_desc(row.get("desc") or row.get("taxonomy_description")),
                 "state": row.get("state"),
                 "license": row.get("license"),
                 "primary": True,
@@ -40,7 +45,7 @@ def _primary_taxonomy(taxonomies: list[dict[str, Any]]) -> dict[str, Any] | None
     row = taxonomies[0]
     return {
         "code": row.get("code"),
-        "description": row.get("desc") or row.get("taxonomy_description"),
+        "description": _clean_desc(row.get("desc") or row.get("taxonomy_description")),
         "state": row.get("state"),
         "license": row.get("license"),
         "primary": False,

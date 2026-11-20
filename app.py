@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+import base64
 import os
+import secrets
 
 
 def _load_local_env() -> None:
@@ -54,6 +56,33 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def password_gate(request: Request, call_next):
+    expected = os.environ.get("APP_PASSWORD", "").strip()
+    if not expected or request.url.path == "/health":
+        return await call_next(request)
+
+    auth = request.headers.get("authorization", "")
+    authorized = False
+    if auth.lower().startswith("basic "):
+        try:
+            decoded = base64.b64decode(auth[6:].strip()).decode("utf-8")
+            _, _, password = decoded.partition(":")
+            authorized = secrets.compare_digest(password, expected)
+        except Exception:
+            authorized = False
+    elif auth.lower().startswith("bearer "):
+        authorized = secrets.compare_digest(auth[7:].strip(), expected)
+
+    if not authorized:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Authentication required"},
+            headers={"WWW-Authenticate": 'Basic realm="Provider Status"'},
+        )
+    return await call_next(request)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

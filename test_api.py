@@ -278,3 +278,18 @@ def test_web_ui_assets_served() -> None:
         assert "/provider-status" in js.text
         assert "transaction_support" in js.text
         assert "chs-provider-status-history" in js.text
+
+
+def test_password_gate(monkeypatch):
+    import base64
+    from fastapi.testclient import TestClient
+    from app import app
+
+    monkeypatch.setenv("APP_PASSWORD", "test-gate-pass")
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert client.get("/").status_code == 401
+        assert client.get("/payers").status_code == 401
+        token = base64.b64encode(b"scott:test-gate-pass").decode()
+        assert client.get("/", headers={"Authorization": f"Basic {token}"}).status_code == 200
+        assert client.get("/payers", headers={"Authorization": "Bearer test-gate-pass"}).status_code == 200

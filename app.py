@@ -187,3 +187,48 @@ async def eligibility_readiness(payload: EligibilityReadinessRequest, request: R
     not logged or stored, and the response omits member name/DOB and masks the member ID.
     """
     return await run_readiness_check(request.app.state.http, payload.model_dump())
+
+
+@app.get("/search/name")
+async def search_name(
+    request: Request,
+    q: str = Query(..., min_length=2, max_length=120, description="Practice or provider name, e.g. 'Aeterna Aesthetics' or 'Dr. Christine Snoke'"),
+    state: str | None = Query(None, min_length=2, max_length=2, description="2-letter state"),
+    city: str | None = Query(None, max_length=60),
+    kind: str = Query("auto", pattern="^(auto|organization|individual)$"),
+    limit: int = Query(25, ge=1, le=50),
+) -> dict[str, Any]:
+    """Friendly name -> probable NPI matches from the CMS NPPES NPI Registry."""
+    from name_search import search_by_name
+
+    return await search_by_name(request.app.state.http, q, state=state, city=(city or "").strip() or None, kind=kind, limit=limit)
+
+
+@app.get("/search/affiliated")
+async def search_affiliated(request: Request, npi: str = Query(...)) -> dict[str, Any]:
+    """Individual NPIs likely affiliated with an organization NPI (same address/phone, authorized official)."""
+    from name_search import find_affiliated, nppes_search, summarize_result
+
+    try:
+        npi = validate_npi(npi)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    rows, error = await nppes_search(request.app.state.http, {"number": npi}, limit=1)
+    if error or not rows:
+        raise HTTPException(status_code=404, detail=error or "NPI not found in NPPES")
+    org = summarize_result(rows[0])
+    if org["type"] != "organization":
+        raise HTTPException(status_code=400, detail="Affiliated-provider search needs an organization (NPI-2)")
+    return await find_affiliated(request.app.state.http, org)
+
+
+@app.get("/readiness-report")
+async def readiness_report(request: Request, npi: str = Query(...)) -> dict[str, Any]:
+    """Readiness-to-bill report: all public sources + Stedi enrollment/payer support, with verdicts."""
+    from readiness import build_report
+
+    try:
+        npi = validate_npi(npi)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await build_report(request.app.state.http, npi)

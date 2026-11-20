@@ -44,6 +44,9 @@ uvicorn app:app --host 127.0.0.1 --port 8080
 | `GET` | `/payers` | Live FHIR payers, CMS sources, Stedi URLs, and the `unsupported_or_auth_required` list |
 | `GET` | `/provider-status?npi=&payer=&tin=` | Combined lookup. `payer` and `tin` are optional. |
 | `POST` | `/provider-status/batch` | Up to 50 `{npi, payer?, tin?}` items, run with bounded concurrency |
+| `GET` | `/search/name?q=&state=&city=&kind=auto\|organization\|individual&limit=25` | Friendly name → ranked probable NPI matches from the NPPES NPI Registry |
+| `GET` | `/search/affiliated?npi=` | Individuals likely affiliated with an organization NPI (same practice address/phone, authorized official) |
+| `GET` | `/readiness-report?npi=` | Readiness-to-bill report: overall verdict + per-payer table from every public source and Stedi |
 | `POST` | `/eligibility-readiness` | Eligibility Readiness Check: one Stedi real-time 270/271 under the NPI, classified as RECOGNIZED / PROVIDER_NOT_RECOGNIZED / PATIENT_ISSUE / PAYER_UNAVAILABLE / INCONCLUSIVE |
 | `GET` | `/payers/search?q=` | Stedi Payer Network search (payer typeahead) with eligibility / claims / ERA support |
 | `GET` | `/eligibility-readiness/prefill?npi=` | Provider name from NPPES (org vs. first/last) to prefill the check |
@@ -59,6 +62,21 @@ curl -sS "http://127.0.0.1:8080/provider-status?npi=1003000126&payer=cigna"
 ```
 
 `payer` accepts names or aliases such as `cigna`, `humana`, `uhc`, `unitedhealthcare`, `centene`, `molina`, `bcbsri`, `medicare` / `pecos`, or a major payer that is documented as auth-required (for example `aetna`). For `medicare`, only NPPES + PECOS + Stedi run. For `aetna`, public CMS results still return and the FHIR section explains that OAuth / registration is required.
+
+## Find Provider → Readiness Report (default tab)
+
+1. **Find provider.** Type a practice or person ("Aeterna Aesthetics", "Dr. Christine Snoke", "Snoke, Christine"), optionally a state and city, and pick Auto / Organization / Individual. `GET /search/name` normalizes the text (punctuation, titles and credentials like Dr/MD/NP/FNP-C, entity suffixes like LLC/PLLC/PC/Inc), builds NPPES query variants (exact org name, `name*` wildcard with the NPPES 2-character minimum, first word*, first+last, both name orders, `first*`/`last*`), runs them concurrently, merges by NPI, and ranks by name similarity (organization name plus NPPES other/DBA names), state/city match, active status, and type. Each result has NPI, type, name, credential, primary taxonomy, practice address and phone, enumeration/last-updated dates, authorized official (orgs), and a match score with reasons.
+2. **Select the NPI.** For organizations, **Show affiliated providers** lists individual NPIs at the same practice address (same 9-digit ZIP and street, "same suite" when identical), same phone, or matching the authorized official.
+3. **Readiness report.** `GET /readiness-report` runs in parallel: NPPES, Medicare PECOS, all live Plan-Net FHIR directories, Stedi enrollments, Stedi payer transaction support, OIG LEIE, CMS opt-out, Order & Referring, Medicare reassignment (individual → groups, or group PAC ID → members), and revalidation due dates. It returns an overall verdict and a per-payer table (Medicare, each FHIR payer, each Stedi-enrolled payer) with **Ready / Likely ready / Not ready / Unknown**, reasons, and sources. Each row has an **Eligibility check** button that opens the Eligibility Readiness tab prefilled with the NPI and payer.
+
+Verdict rules (summary):
+- Blockers → overall Not ready: NPI not in NPPES or deactivated; NPI on OIG LEIE.
+- Medicare: active opt-out → Not ready; in PECOS → Ready (reassignment groups and revalidation dates are listed); not in PECOS → Not ready (the public extract lags).
+- Other payers: Stedi enrollment LIVE + listed in the payer's directory → Ready; one of the two → Likely ready; enrollment pending or rejected → Not ready; nothing found → Unknown (absence from a directory isn't proof).
+
+Public sources used (all free, no key): NPPES API; data.cms.gov Medicare FFS Public Provider Enrollment, Opt Out Affidavits (`9887a515-…`), Order and Referring (`c99b5865-…`), Revalidation Reassignment List (`20f51cff-…`), Revalidation Due Date List (`3746498e-…`); HHS-OIG LEIE `UPDATED.csv` (downloaded on first use, cached in memory, refreshed every 24 h; DOBs never stored or returned). Skipped: SAM.gov (needs an API key), state Medicaid lists (no common free API), OAuth-only payer directories.
+
+Deep links: `/?tab=find&q=Aeterna%20Aesthetics&state=OH` runs the search; `/?npi=1699443499` opens the readiness report. (Single Lookup moved to `/?tab=lookup&npi=…`.) Browser history for reports stores only NPI, provider name, verdict, and time.
 
 ## Eligibility Readiness Check
 
@@ -180,6 +198,11 @@ models.py           Request models
 test_api.py         Unit + live smoke tests
 test_eligibility.py Eligibility readiness unit tests (mocked Stedi, PHI-not-logged checks)
 eligibility.py      Eligibility readiness request building + 271 classification
+name_search.py      Friendly NPPES name search, ranking, affiliated providers
+readiness.py        Readiness-to-bill report and verdict logic
+clients/cms_extra.py  CMS opt-out, Order & Referring, reassignment, revalidation
+clients/leie.py     HHS-OIG LEIE exclusion list (cached CSV)
+test_find_report.py Name search / sources / verdict tests (+ live NPPES checks)
 clients/nppes.py    CMS NPPES
 clients/pecos.py    CMS PECOS public enrollment
 clients/fhir.py     Plan-Net FHIR

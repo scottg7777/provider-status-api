@@ -263,3 +263,14 @@ def unsupported_by_id(payer_id: str) -> UnsupportedPayer | None:
         if payer.id == payer_id:
             return payer
     return None
+
+# Additional free CMS data.cms.gov series (the "latest" series IDs from data.cms.gov/data.json,
+# live-tested 2026-11-20 with filter[...] NPI queries, no auth).
+CMS_DATA_API = "https://data.cms.gov/data-api/v1/dataset"
+CMS_ORDER_REFERRING_ID = "c99b5865-1119-4436-bb80-c5af2773ea1f"  # Order and Referring
+CMS_REASSIGNMENT_ID = "20f51cff-4137-4f3a-b6b7-bfc9ad57983b"  # Revalidation Reassignment List
+CMS_REVALIDATION_DUE_ID = "3746498e-874d-45d8-9c69-68603cafea60"  # Revalidation Due Date List
+CMS_OPT_OUT_ID = "9887a515-7552-4693-bf58-735c77af46d7"  # Opt Out Affidavits
+
+# HHS-OIG List of Excluded Individuals/Entities (LEIE), full monthly CSV (~11 MB, no auth).
+OIG_LEIE_CSV_URL = "https://oig.hhs.gov/exclusions/downloadables/UPDATED.csv"

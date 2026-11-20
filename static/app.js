@@ -981,6 +981,290 @@
     renderEligHistory();
   }
 
+
+  /* ---------------- Find provider + readiness report ---------------- */
+  const REPORT_HISTORY_KEY = "chs-readiness-report-history-v1";
+  const READY_LABELS = { READY: "Ready", LIKELY_READY: "Likely ready", NOT_READY: "Not ready", UNKNOWN: "Unknown" };
+  const findState = { results: [], lastReport: null };
+
+  function readyBadge(status, small = false) {
+    const key = READY_LABELS[status] ? status : "UNKNOWN";
+    return `<span class="ready-badge ${small ? "sm" : ""} ready-${key}"><span class="dot"></span>${escapeHtml(READY_LABELS[key])}</span>`;
+  }
+
+  function setStep(n) {
+    [1, 2, 3].forEach((i) => {
+      const el = $(`step-${i}`);
+      if (!el) return;
+      el.classList.toggle("is-current", i === n);
+      el.classList.toggle("is-done", i < n);
+    });
+  }
+
+  function addrLine(a) {
+    if (!a) return "—";
+    return escapeHtml([a.address_1, a.address_2, [a.city, a.state, (a.postal_code || "").slice(0, 5)].filter(Boolean).join(", ")].filter(Boolean).join(", "));
+  }
+
+  function matchCard(r, opts = {}) {
+    const tax = r.primary_taxonomy || {};
+    const a = r.practice_address || {};
+    const other = (r.other_names || []).map((o) => o.name).filter(Boolean);
+    const reasons = opts.reasons || r.match_reasons || [];
+    return `
+      <article class="card match-card">
+        <div class="card-head" style="margin-bottom:0">
+          <h3>${text(r.name)}${r.credential ? ` <span class="muted">${text(r.credential)}</span>` : ""}</h3>
+          <div class="meta-row" style="margin:0">
+            ${badge(r.type === "organization" ? "Organization · NPI-2" : "Individual · NPI-1", "navy")}
+            ${r.active ? badge("Active", "good") : badge("Deactivated", "warn")}
+          </div>
+        </div>
+        <div class="match-meta">
+          <div><strong>NPI ${text(r.npi)}</strong>${r.score != null ? ` · <span class="score">match ${text(r.score)}</span>` : ""}</div>
+          <div>${text(tax.description || tax.code)}${tax.state ? ` · ${text(tax.state)}` : ""}</div>
+          <div>${addrLine(a)}${a.telephone ? ` · ${text(a.telephone)}` : ""}</div>
+          ${other.length ? `<div class="muted">Also known as: ${text(other.join("; "))}</div>` : ""}
+          ${r.authorized_official ? `<div class="muted">Authorized official: ${text([r.authorized_official.first_name, r.authorized_official.last_name].filter(Boolean).join(" "))}${r.authorized_official.title ? ` (${text(r.authorized_official.title)})` : ""}</div>` : ""}
+          <div class="muted">Enumerated ${text(r.enumeration_date)} · updated ${text(r.last_updated)}</div>
+          ${reasons.length ? `<div class="muted">${text(reasons.join(" · "))}</div>` : ""}
+        </div>
+        <div class="actions">
+          <button type="button" class="btn btn-primary btn-sm" data-select-npi="${escapeHtml(r.npi)}">Select &amp; run report</button>
+          ${r.type === "organization" && !opts.nested ? `<button type="button" class="btn btn-ghost btn-sm" data-affiliated="${escapeHtml(r.npi)}">Show affiliated providers</button>` : ""}
+        </div>
+        <div class="affiliated" data-affiliated-box="${escapeHtml(r.npi)}" hidden></div>
+      </article>`;
+  }
+
+  function bindSelectButtons(root) {
+    root.querySelectorAll("[data-select-npi]").forEach((b) => {
+      if (b.dataset.bound) return;
+      b.dataset.bound = "1";
+      b.addEventListener("click", () => runReport(b.getAttribute("data-select-npi")));
+    });
+  }
+
+  async function loadAffiliated(npi, button) {
+    const box = document.querySelector(`[data-affiliated-box="${CSS.escape(npi)}"]`);
+    if (!box) return;
+    if (!box.hidden && box.dataset.loaded) { box.hidden = true; button.textContent = "Show affiliated providers"; return; }
+    box.hidden = false;
+    button.textContent = "Hide affiliated providers";
+    if (box.dataset.loaded) return;
+    box.innerHTML = `<span class="muted">Searching NPPES for providers at the same address/phone…</span>`;
+    try {
+      const data = await fetchJson(`/search/affiliated?npi=${encodeURIComponent(npi)}`);
+      box.dataset.loaded = "1";
+      const rows = (data.results || []).map((p) => `
+        <li><strong>${text(p.name)}</strong>${p.credential ? ` ${text(p.credential)}` : ""} · NPI ${text(p.npi)} · ${text((p.primary_taxonomy || {}).description)}
+          <br><span class="muted">${text((p.affiliation_reasons || []).join(" · "))}</span>
+          <button type="button" class="btn btn-ghost btn-sm" data-select-npi="${escapeHtml(p.npi)}">Select</button></li>`).join("");
+      box.innerHTML = rows
+        ? `<div class="muted">${text(data.note)}</div><ul>${rows}</ul>`
+        : `<span class="muted">No individual NPIs found at the same practice address or phone.</span>`;
+      bindSelectButtons(box);
+    } catch (error) {
+      box.innerHTML = `<span class="muted">${text(error.message || "Affiliated search failed.")}</span>`;
+    }
+  }
+
+  async function runFind(event) {
+    if (event) event.preventDefault();
+    const q = $("find-q").value.trim();
+    if (q.length < 2) return;
+    const params = new URLSearchParams({ q });
+    const st = $("find-state").value.trim().toUpperCase();
+    const city = $("find-city").value.trim();
+    const kind = (document.querySelector('input[name="find-kind"]:checked') || {}).value || "auto";
+    if (st) params.set("state", st);
+    if (city) params.set("city", city);
+    if (kind !== "auto") params.set("kind", kind);
+    const btn = $("find-submit");
+    btn.disabled = true;
+    setStep(1);
+    $("report-results").innerHTML = "";
+    showStatus($("report-status"), "", "");
+    showStatus($("find-status"), "Searching the NPPES NPI Registry…", "");
+    try {
+      const data = await fetchJson(`/search/name?${params.toString()}`);
+      findState.results = data.results || [];
+      const url = new URL(window.location.href);
+      url.search = "";
+      url.searchParams.set("tab", "find");
+      url.searchParams.set("q", q);
+      if (st) url.searchParams.set("state", st);
+      if (city) url.searchParams.set("city", city);
+      window.history.replaceState(null, "", url.toString());
+      if (!findState.results.length) {
+        showStatus($("find-status"), `No NPI matches for "${q}". Try fewer words, a different spelling, or remove the city.`, "is-error");
+        $("find-results").innerHTML = "";
+        return;
+      }
+      setStep(2);
+      showStatus($("find-status"), `${data.total_candidates} candidate(s); showing the top ${findState.results.length}. Pick the right NPI.`, "is-ok");
+      $("find-results").innerHTML = `<div class="match-grid">${findState.results.map((r) => matchCard(r)).join("")}</div>`;
+      bindSelectButtons($("find-results"));
+      $("find-results").querySelectorAll("[data-affiliated]").forEach((b) => {
+        b.addEventListener("click", () => loadAffiliated(b.getAttribute("data-affiliated"), b));
+      });
+    } catch (error) {
+      showStatus($("find-status"), error.message || "Name search failed.", "is-error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function sourceLinks(list) {
+    return (list || []).filter(Boolean).map((s) =>
+      /^https?:/.test(s) ? `<a href="${escapeHtml(s)}" target="_blank" rel="noopener">${escapeHtml(s.replace(/^https?:\/\//, "").split("/")[0])}</a>` : `<span class="muted">${escapeHtml(s)}</span>`
+    ).join(" ");
+  }
+
+  function renderReport(data) {
+    const p = data.provider || {};
+    const o = data.overall || {};
+    const c = data.checks || {};
+    const tax = p.primary_taxonomy || {};
+    const rows = (data.payers || []).map((r, i) => `
+      <tr>
+        <td><strong>${text(r.payer)}</strong></td>
+        <td>${readyBadge(r.status, true)}</td>
+        <td><ul class="reason-list">${(r.reasons || []).map((x) => `<li>${text(x)}</li>`).join("")}</ul></td>
+        <td class="source-links">${sourceLinks(r.sources)}</td>
+        <td><button type="button" class="btn btn-ghost btn-sm" data-elig-row="${i}">Eligibility check</button></td>
+      </tr>`).join("");
+    const leie = c.oig_leie || {};
+    const opt = c.opt_out || {};
+    const oref = c.order_referring || {};
+    const re = c.reassignment || {};
+    const gr = c.group_reassignment || {};
+    const rv = c.revalidation || {};
+    const pecos = c.medicare_pecos || {};
+    const yes = (v, y = "Yes", n = "No") => (v === true ? badge(y, "good") : v === false ? badge(n, "muted") : badge("Unavailable", "warn"));
+    const checks = `
+      <div class="check-grid">
+        <div class="check"><strong>NPPES</strong>${p.found ? (p.active ? badge("Active", "good") : badge("Deactivated", "bad")) : badge("Not found", "bad")} ${text(p.enumeration_type)}<div class="muted">${text(tax.description)}</div></div>
+        <div class="check"><strong>OIG LEIE exclusions</strong>${leie.excluded === true ? badge("EXCLUDED", "bad") : leie.excluded === false ? badge("Not excluded", "good") : badge("Unavailable", "warn")}
+          <div class="muted">${leie.row_count ? `${text(leie.row_count)} records · file ${text(leie.file_last_modified)}` : text(leie.error)}</div>
+          ${(leie.possible_name_matches || []).length ? `<div class="muted">${text(leie.possible_name_matches.length)} possible name match(es) without NPI. <a href="${escapeHtml(leie.verify_url)}" target="_blank" rel="noopener">Verify</a></div>` : ""}</div>
+        <div class="check"><strong>Medicare PECOS</strong>${yes(pecos.enrolled, "Enrolled", "Not enrolled")}<div class="muted">${text((pecos.provider_types || []).join("; "))}</div></div>
+        <div class="check"><strong>Medicare opt-out</strong>${opt.active_opt_out === true ? badge("Opted out", "bad") : opt.active_opt_out === false ? badge(opt.found ? "Past opt-out only" : "No opt-out", "good") : badge("Unavailable", "warn")}</div>
+        <div class="check"><strong>Order &amp; Referring</strong>${p.enumeration_type === "NPI-2" ? badge("N/A for groups", "muted") : yes(oref.found, "Listed", "Not listed")}<div class="muted">${oref.found ? `Part B ${oref.part_b ? "Y" : "N"} · DME ${oref.dme ? "Y" : "N"} · HHA ${oref.hha ? "Y" : "N"}` : ""}</div></div>
+        <div class="check"><strong>Medicare reassignment</strong>${(re.reassignments || []).length ? badge(`${re.reassignments.length} group(s)`, "info") : (gr && (gr.members || []).length) ? badge(`${gr.members.length} member(s)`, "info") : badge("None found", "muted")}
+          <div class="muted">${text([...new Set((re.reassignments || []).map((x) => x.group_name))].join("; "), "")}</div></div>
+        <div class="check"><strong>Revalidation</strong>${(rv.enrollments || []).length ? text((rv.enrollments || []).map((e) => e.adjusted_due_date || e.revalidation_due_date || "TBD").join(", ")) : badge("Not listed", "muted")}</div>
+        <div class="check"><strong>Stedi EDI enrollment</strong>${(c.stedi_enrollment || {}).configured === false ? badge("Not configured", "warn") : (c.stedi_enrollment || {}).enrollment_count ? badge(`${c.stedi_enrollment.enrollment_count} enrollment(s)`, "info") : badge("None", "muted")}</div>
+      </div>`;
+    return `
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <div class="verdict-banner">${readyBadge(o.status)}<h2>${text(o.headline)}</h2></div>
+            <p class="muted" style="margin:6px 0 0">${text(p.name)} · NPI ${text(data.npi)} · ${text(p.enumeration_type === "NPI-2" ? "Organization" : "Individual")} · ${text(tax.description)}</p>
+          </div>
+          <div class="meta-row"><button type="button" class="btn btn-ghost btn-sm" id="report-to-elig">Eligibility readiness check</button></div>
+        </div>
+        ${(o.blockers || []).length ? `<div class="callout"><strong>Blockers:</strong> ${text(o.blockers.join("; "))}</div>` : ""}
+        ${(data.warnings || []).map((w) => `<div class="callout">${text(w)}</div>`).join("")}
+        <div class="table-wrap" style="margin-top:14px">
+          <table><thead><tr><th>Payer</th><th>Readiness</th><th>Reasons</th><th>Sources</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+        </div>
+        <p class="elig-caveat">${text(data.caveat)}</p>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Public source checks</h2><span class="muted">${text(data.checked_at ? new Date(data.checked_at).toLocaleString() : "")}</span></div>
+        ${checks}
+        <p class="muted" style="margin-top:12px;font-size:0.84rem">Skipped: ${text((data.skipped_sources || []).map((s) => `${s.name} (${s.reason})`).join(" · "))}</p>
+      </section>
+      ${renderJsonTools(data, `readiness-${data.npi || "report"}.json`)}`;
+  }
+
+  function rememberReport(data) {
+    const entry = {
+      ts: new Date().toISOString(),
+      npi: data.npi,
+      name: (data.provider || {}).name || "",
+      verdict: (data.overall || {}).status || "",
+    };
+    const items = loadReportHistory().filter((r) => r.npi !== entry.npi);
+    items.unshift(entry);
+    localStorage.setItem(REPORT_HISTORY_KEY, JSON.stringify(items.slice(0, HISTORY_LIMIT)));
+    renderReportHistory();
+  }
+
+  function loadReportHistory() {
+    try {
+      const raw = localStorage.getItem(REPORT_HISTORY_KEY);
+      const items = raw ? JSON.parse(raw) : [];
+      return Array.isArray(items) ? items : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function renderReportHistory() {
+    const root = $("report-history-results");
+    if (!root) return;
+    const items = loadReportHistory();
+    if (!items.length) {
+      root.innerHTML = `<p class="empty">No readiness reports saved in this browser yet.</p>`;
+      return;
+    }
+    root.innerHTML = `
+      <div class="table-wrap"><table>
+        <thead><tr><th>When</th><th>NPI</th><th>Provider</th><th>Verdict</th><th></th></tr></thead>
+        <tbody>${items.map((row, i) => `
+          <tr><td>${text(row.ts ? new Date(row.ts).toLocaleString() : "")}</td><td>${text(row.npi)}</td><td>${text(row.name)}</td>
+          <td>${readyBadge(row.verdict, true)}</td>
+          <td><button type="button" class="btn btn-ghost btn-sm" data-report-history="${i}">Open</button></td></tr>`).join("")}</tbody>
+      </table></div>`;
+    root.querySelectorAll("[data-report-history]").forEach((b) => {
+      b.addEventListener("click", () => {
+        const row = items[Number(b.getAttribute("data-report-history"))];
+        if (row) runReport(row.npi);
+      });
+    });
+  }
+
+  async function runReport(npi) {
+    if (!/^\d{10}$/.test(String(npi || ""))) return;
+    switchTab("find");
+    setStep(3);
+    const statusEl = $("report-status");
+    showStatus(statusEl, `Running readiness checks for NPI ${npi} (NPPES, PECOS, opt-out, LEIE, payer directories, Stedi)… this can take 30–60 seconds.`, "");
+    $("report-results").innerHTML = "";
+    const url = new URL(window.location.href);
+    url.search = "";
+    url.searchParams.set("npi", npi);
+    window.history.replaceState(null, "", url.toString());
+    try {
+      const data = await fetchJson(`/readiness-report?npi=${encodeURIComponent(npi)}`);
+      findState.lastReport = data;
+      showStatus(statusEl, "", "");
+      const root = $("report-results");
+      root.innerHTML = renderReport(data);
+      hydrateJson(root, data);
+      root.querySelectorAll("[data-elig-row]").forEach((b) => {
+        b.addEventListener("click", () => {
+          const row = (data.payers || [])[Number(b.getAttribute("data-elig-row"))];
+          openEligibility(data.npi, row ? row.eligibility_payer || row.payer : "");
+        });
+      });
+      const top = $("report-to-elig");
+      if (top) top.addEventListener("click", () => openEligibility(data.npi, ""));
+      rememberReport(data);
+      root.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (error) {
+      showStatus(statusEl, error.message || "Readiness report failed.", "is-error");
+    }
+  }
+
+  function bindFind() {
+    $("find-form").addEventListener("submit", runFind);
+    renderReportHistory();
+  }
+
   function switchTab(id) {
     document.querySelectorAll(".tab").forEach((tab) => {
       const active = tab.dataset.tab === id;
@@ -991,7 +1275,7 @@
       panel.hidden = panel.id !== `panel-${id}`;
       panel.classList.toggle("is-active", !panel.hidden);
     });
-    if (id === "history") { renderHistory(); renderEligHistory(); }
+    if (id === "history") { renderHistory(); renderEligHistory(); renderReportHistory(); }
     if (id === "payers" && state.payersCatalog) renderPayersTab(state.payersCatalog);
   }
 
@@ -1022,8 +1306,10 @@
     $("history-clear").addEventListener("click", () => {
       localStorage.removeItem(HISTORY_KEY);
       localStorage.removeItem(ELIG_HISTORY_KEY);
+      localStorage.removeItem(REPORT_HISTORY_KEY);
       renderHistory();
       renderEligHistory();
+      renderReportHistory();
     });
     document.querySelectorAll("[data-close-drawer]").forEach((el) => el.addEventListener("click", closeDrawer));
     document.addEventListener("keydown", (event) => {
@@ -1034,6 +1320,7 @@
   async function init() {
     bind();
     bindEligibility();
+    bindFind();
     renderHistory();
     updateBatchCount();
     await refreshHealth();
@@ -1044,7 +1331,23 @@
       showStatus($("payers-status"), error.message || "Unable to load payer catalog.", "is-error");
     }
     const qs = new URLSearchParams(window.location.search);
-    if (qs.get("tab") === "eligibility") {
+    const tab = qs.get("tab");
+    if (tab === "find" || (!tab && !qs.get("npi"))) {
+      switchTab("find");
+      if (qs.get("q")) {
+        $("find-q").value = qs.get("q");
+        if (qs.get("state")) $("find-state").value = qs.get("state");
+        if (qs.get("city")) $("find-city").value = qs.get("city");
+        await runFind();
+      }
+    } else if (!tab && qs.get("npi")) {
+      await runReport(qs.get("npi").trim());
+    } else if (tab === "lookup" && qs.get("npi")) {
+      switchTab("lookup");
+      $("npi").value = qs.get("npi");
+      if (qs.get("payer")) $("payer").value = qs.get("payer");
+      await runLookup();
+    } else if (qs.get("tab") === "eligibility") {
       openEligibility(qs.get("npi") || "", qs.get("payer") || "");
     } else if (qs.get("tab") && document.querySelector(`.tab[data-tab="${qs.get("tab")}"]`)) {
       switchTab(qs.get("tab"));

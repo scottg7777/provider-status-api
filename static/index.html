@@ -36,7 +36,8 @@
     </header>
 
     <nav class="tabs" role="tablist" aria-label="Workspace">
-      <button class="tab is-active" role="tab" aria-selected="true" data-tab="lookup">Single Lookup</button>
+      <button class="tab is-active" role="tab" aria-selected="true" data-tab="find">Find Provider</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="lookup">Single Lookup</button>
       <button class="tab" role="tab" aria-selected="false" data-tab="eligibility">Eligibility Readiness</button>
       <button class="tab" role="tab" aria-selected="false" data-tab="batch">Batch Lookup</button>
       <button class="tab" role="tab" aria-selected="false" data-tab="payers">Supported Payers</button>
@@ -44,7 +45,44 @@
     </nav>
 
     <main>
-      <section id="panel-lookup" class="panel is-active" role="tabpanel">
+      <section id="panel-find" class="panel is-active" role="tabpanel">
+        <ol class="stepper" aria-label="Steps">
+          <li id="step-1" class="is-current"><span>1</span>Find provider</li>
+          <li id="step-2"><span>2</span>Select NPI</li>
+          <li id="step-3"><span>3</span>Readiness report</li>
+        </ol>
+        <form id="find-form" class="lookup-form card" autocomplete="off">
+          <div class="form-grid find-grid">
+            <label class="field">
+              <span>Practice or provider name</span>
+              <input id="find-q" name="q" minlength="2" maxlength="120" placeholder="e.g. Aeterna Aesthetics, Dr. Christine Snoke, Snoke Christine" required>
+            </label>
+            <label class="field">
+              <span>State <em>(optional)</em></span>
+              <input id="find-state" name="state" maxlength="2" placeholder="OH" autocomplete="off">
+            </label>
+            <label class="field">
+              <span>City <em>(optional)</em></span>
+              <input id="find-city" name="city" maxlength="60" placeholder="West Chester">
+            </label>
+            <div class="field field-action">
+              <button type="submit" class="btn btn-primary" id="find-submit">Find NPI matches</button>
+            </div>
+          </div>
+          <div class="kind-toggle" role="radiogroup" aria-label="Provider type">
+            <label><input type="radio" name="find-kind" value="auto" checked> Auto-detect</label>
+            <label><input type="radio" name="find-kind" value="organization"> Practice / organization</label>
+            <label><input type="radio" name="find-kind" value="individual"> Individual provider</label>
+            <span class="muted">Searches the CMS NPPES NPI Registry.</span>
+          </div>
+        </form>
+        <div id="find-status" class="status-line" hidden></div>
+        <div id="find-results"></div>
+        <div id="report-status" class="status-line" hidden></div>
+        <div id="report-results"></div>
+      </section>
+
+      <section id="panel-lookup" class="panel" role="tabpanel" hidden>
         <form id="lookup-form" class="lookup-form card" autocomplete="off">
           <div class="form-grid">
             <label class="field">
@@ -204,6 +242,9 @@
             <button type="button" id="history-clear" class="btn btn-ghost">Clear history</button>
           </div>
           <div id="history-results"></div>
+          <h3 class="history-subhead">Readiness reports</h3>
+          <p class="muted">NPI, provider name, verdict, and time only.</p>
+          <div id="report-history-results"></div>
           <h3 class="history-subhead">Eligibility readiness checks</h3>
           <p class="muted">Only NPI, payer, result, and time are saved. Member data is never stored.</p>
           <div id="elig-history-results"></div>
